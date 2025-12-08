@@ -16,6 +16,9 @@
 static llvm::cl::opt<bool> forceNoAlias("force-no-alias", llvm::cl::Hidden,
                                         llvm::cl::init(true));
 
+static llvm::cl::opt<bool> useStableHlo("use-stablehlo", llvm::cl::Hidden,
+                                        llvm::cl::init(false));
+
 namespace fir {
 
 template <typename F>
@@ -277,6 +280,12 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
           {/*allowNewSideEffects=*/false, config.fpMaxminBehavior});
     });
   }
+
+  if (useStableHlo) {
+    pm.addPass(flangomp::createLowerWorkdistributeToStableHlo());
+  }
+
+
   addNestedPassToAllTopLevelOperations<PassConstructor>(
       pm, hlfir::createInlineElementals);
   if (optLevel.isOptimizingForSpeed()) {
