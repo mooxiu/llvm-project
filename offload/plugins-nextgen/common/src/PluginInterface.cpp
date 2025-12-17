@@ -562,6 +562,13 @@ GenericKernelTy::prepareBlockMemory(GenericDeviceTy &GenericDevice,
                            DynFallbackPtr};
 }
 
+Error GenericKernelTy::delegatedLaunch(
+    GenericDeviceTy &GenericDevice,
+    std::function<int64_t(void *)> &DelegatedLaunch,
+    AsyncInfoWrapperTy &AsyncInfoWrapper) const {
+  return delegatedLaunchImpl(GenericDevice, DelegatedLaunch, AsyncInfoWrapper);
+}
+
 Error GenericKernelTy::launch(GenericDeviceTy &GenericDevice, void **ArgPtrs,
                               ptrdiff_t *ArgOffsets, KernelArgsTy &KernelArgs,
                               AsyncInfoWrapperTy &AsyncInfoWrapper) const {
@@ -1467,6 +1474,42 @@ Error GenericDeviceTy::launchKernel(void *EntryPtr, void **ArgPtrs,
   return Err;
 }
 
+Error GenericDeviceTy::delegatedLaunchKernel(
+    void *EntryPtr, std::function<int64_t(void *)> &DelegatedLaunch,
+    __tgt_async_info *AsyncInfo) {
+  AsyncInfoWrapperTy AsyncInfoWrapper(
+      *this,
+      Plugin.getRecordReplay().isRecordingOrReplaying() ? nullptr : AsyncInfo);
+
+  GenericKernelTy &GenericKernel =
+      *reinterpret_cast<GenericKernelTy *>(EntryPtr);
+
+  {
+    std::string StackTrace;
+    if (OMPX_TrackNumKernelLaunches) {
+      llvm::raw_string_ostream OS(StackTrace);
+      llvm::sys::PrintStackTrace(OS);
+    }
+
+    auto KernelTraceInfoRecord = KernelLaunchTraces.getExclusiveAccessor();
+    (*KernelTraceInfoRecord)
+        .emplace(&GenericKernel, std::move(StackTrace), AsyncInfo);
+  }
+
+  auto Err =
+      GenericKernel.delegatedLaunch(*this, DelegatedLaunch, AsyncInfoWrapper);
+
+  // 'finalize' here to guarantee next record-replay actions are in-sync
+  AsyncInfoWrapper.finalize(Err);
+
+  RecordReplayTy &RecordReplay = Plugin.getRecordReplay();
+  if (RecordReplay.isRecordingOrReplaying() &&
+      RecordReplay.isSaveOutputEnabled())
+    RecordReplay.saveKernelOutputInfo(GenericKernel.getName());
+
+  return Err;
+}
+
 Error GenericDeviceTy::initAsyncInfo(__tgt_async_info **AsyncInfoPtr) {
   assert(AsyncInfoPtr && "Invalid async info");
 
@@ -1821,6 +1864,25 @@ int32_t GenericPluginTy::initialize_record_replay(int32_t DeviceId,
   return OFFLOAD_SUCCESS;
 }
 
+int32_t GenericPluginTy::get_dummy_function(int32_t DeviceId,
+                                            void **KernelPtr) {
+  GenericDeviceTy &Device = getDevice(DeviceId);
+
+  const char *Name = "__offload__dummy_function";
+
+  auto KernelOrErr = Device.constructKernel(Name);
+  if (Error Err = KernelOrErr.takeError()) {
+    REPORT("Failure to construct dummy function: %s\n",
+           toString(std::move(Err)).data());
+    return OFFLOAD_FAIL;
+  }
+
+  GenericKernelTy &Kernel = *KernelOrErr;
+  *KernelPtr = &Kernel;
+
+  return OFFLOAD_SUCCESS;
+}
+
 int32_t GenericPluginTy::load_binary(int32_t DeviceId,
                                      __tgt_device_image *TgtImage,
                                      __tgt_device_binary *Binary) {
@@ -1986,6 +2048,21 @@ int32_t GenericPluginTy::data_exchange_async(int32_t SrcDeviceId, void *SrcPtr,
              << ") to device (" << DstDeviceId
              << "). Pointers: host = " << SrcPtr << ", device = " << DstPtr
              << ", size = " << Size << ": " << toString(std::move(Err));
+    return OFFLOAD_FAIL;
+  }
+
+  return OFFLOAD_SUCCESS;
+}
+
+int32_t GenericPluginTy::delegated_launch_kernel(
+    int32_t DeviceId, void *TgtEntryPtr,
+    std::function<int64_t(void *)> &DelegatedLaunch,
+    __tgt_async_info *AsyncInfoPtr) {
+  auto Err = getDevice(DeviceId).delegatedLaunchKernel(
+      TgtEntryPtr, DelegatedLaunch, AsyncInfoPtr);
+  if (Err) {
+    REPORT("Failure to run target jit region in device %d: %s\n", DeviceId,
+           toString(std::move(Err)).data());
     return OFFLOAD_FAIL;
   }
 
