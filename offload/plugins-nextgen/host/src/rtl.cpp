@@ -93,7 +93,19 @@ struct GenELF64KernelTy : public GenericKernelTy {
     return Plugin::success();
   }
 
-  /// Launch the kernel using the arguments.
+  Error
+  delegatedLaunchImpl(GenericDeviceTy &GenericDevice,
+                      std::function<int64_t(void *)> &DelegatedLaunch,
+                      AsyncInfoWrapperTy &AsyncInfoWrapper) const override {
+    Plugin::DelegatedLaunchArgs DLA{
+        Plugin::DelegatedLaunchArgs::DeviceTyTy::HOST, nullptr, nullptr};
+    auto Res = DelegatedLaunch(&DLA);
+    if (Res)
+      return Plugin::check(Res, "error in delegated launch: %s");
+    return Plugin::success();
+  }
+
+  /// Launch the kernel using the libffi.
   Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
                    uint32_t NumBlocks[3], uint32_t DynBlockMemSize,
                    KernelArgsTy &KernelArgs, KernelLaunchParamsTy LaunchParams,
