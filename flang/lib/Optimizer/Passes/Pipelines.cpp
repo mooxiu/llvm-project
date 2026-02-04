@@ -251,6 +251,11 @@ void createDefaultFIROptimizerPassPipeline(mlir::PassManager &pm,
 void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
                                   EnableOpenMP enableOpenMP,
                                   llvm::OptimizationLevel optLevel) {
+  if (jitWorkdistribute) {
+    pm.addPass(flangomp::createLowerWorkdistributeToJit());
+  }
+
+
   if (optLevel.getSizeLevel() > 0 || optLevel.getSpeedupLevel() > 0) {
     addNestedPassToAllTopLevelOperations<PassConstructor>(
         pm, hlfir::createExpressionSimplification);
@@ -259,10 +264,6 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
     addCanonicalizerPassWithoutRegionSimplification(pm);
     addNestedPassToAllTopLevelOperations<PassConstructor>(
         pm, hlfir::createSimplifyHLFIRIntrinsics);
-  }
-
-  if (jitWorkdistribute) {
-    pm.addPass(flangomp::createLowerWorkdistributeToJit());
   }
 
   addNestedPassToAllTopLevelOperations<PassConstructor>(
