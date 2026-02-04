@@ -270,6 +270,10 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
                                   EnableOpenMP enableOpenMP,
                                   const MLIRToLLVMPassPipelineConfig &config) {
   llvm::OptimizationLevel optLevel = config.OptLevel;
+  if (jitWorkdistribute) {
+    pm.addPass(flangomp::createLowerWorkdistributeToJit());
+  }
+
   if (optLevel.getSizeLevel() > 0 || optLevel.getSpeedupLevel() > 0) {
     addNestedPassToAllTopLevelOperations<PassConstructor>(
         pm, hlfir::createExpressionSimplification);
@@ -280,10 +284,6 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
       return hlfir::createSimplifyHLFIRIntrinsics(
           {/*allowNewSideEffects=*/false, config.fpMaxminBehavior});
     });
-  }
-
-  if (jitWorkdistribute) {
-    pm.addPass(flangomp::createLowerWorkdistributeToJit());
   }
 
   addNestedPassToAllTopLevelOperations<PassConstructor>(
