@@ -21,7 +21,6 @@ program test
 
     write (*, '(A)') 'calling axpy'
     b = abs(coexecute_a(x, y, z, N, a))
-
     b = abs(coexecute_a(x, y, z, N, a))
 
     deallocate(x)

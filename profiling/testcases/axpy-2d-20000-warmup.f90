@@ -2,7 +2,7 @@
 program test
     implicit none
 
-    integer, parameter :: N = 1000
+    integer, parameter :: N = 20000
     !integer, parameter :: N = 16
     double precision :: a = 7, b
     double precision, dimension(:, :), allocatable :: x
@@ -21,6 +21,7 @@ program test
 
     write (*, '(A)') 'calling axpy'
     b = abs(coexecute_a(x, y, z, N, a))
+    b = abs(coexecute_a(x, y, z, N, a))
 
     deallocate(x)
     deallocate(y)
@@ -30,7 +31,7 @@ contains
 function coexecute_a(x, y, z, n, a) result(sum_less)
   use omp_lib
   implicit none
-  integer :: n
+  integer :: n, i, j, try
   double precision :: sum_less, a
   double precision, dimension(n, n) :: x, y, z
   double precision :: ostart, oend, allstart, allend
