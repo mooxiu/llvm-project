@@ -1495,8 +1495,12 @@ Error CUDAKernelTy::delegatedLaunchImpl(
                                   &CUDADevice, Stream};
   CUresult Res = (CUresult)DelegatedLaunch(&DLA);
 
-  // Register a callback to indicate when the kernel is complete.
-  if (GenericDevice.getRPCServer())
+  if (GenericDevice.getRPCServer()) {
+    // If we are running an RPC server we want to wake up the server thread
+    // whenever there is a kernel running and let it sleep otherwise.
+    GenericDevice.Plugin.getRPCServer().Thread->notify();
+
+    // Register a callback to indicate when the kernel is complete.
     cuLaunchHostFunc(
         Stream,
         [](void *Data) {
@@ -1504,6 +1508,7 @@ Error CUDAKernelTy::delegatedLaunchImpl(
           Plugin.getRPCServer().Thread->finish();
         },
         &GenericDevice.Plugin);
+  }
 
   return Plugin::check(Res, "error in cuLaunchKernel for '%s': %s", getName());
 }
