@@ -63,7 +63,6 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/TypeSwitch.h"
-#include <mlir/IR/Value.h>
 
 namespace fir {
 #define GEN_PASS_DEF_FIRTOLLVMLOWERING
