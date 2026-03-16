@@ -1247,7 +1247,7 @@ static mlir::SymbolRefAttr
 getMallocInModule(ModuleOp mod, fir::AllocMemOp op,
                   mlir::ConversionPatternRewriter &rewriter,
                   mlir::Type indexType) {
-  static constexpr char mallocName[] = "malloc";
+  static constexpr char mallocName[] = "aligned_alloc";
   if (auto mallocFunc =
           mod.template lookupSymbol<mlir::LLVM::LLVMFuncOp>(mallocName))
     return mlir::SymbolRefAttr::get(mallocFunc);
@@ -1259,7 +1259,7 @@ getMallocInModule(ModuleOp mod, fir::AllocMemOp op,
   auto mallocDecl = mlir::LLVM::LLVMFuncOp::create(
       moduleBuilder, op.getLoc(), mallocName,
       mlir::LLVM::LLVMFunctionType::get(getLlvmPtrType(op.getContext()),
-                                        indexType,
+                                        {indexType, indexType},
                                         /*isVarArg=*/false));
   return mlir::SymbolRefAttr::get(mallocDecl);
 }
@@ -1322,10 +1322,18 @@ struct AllocMemOpConversion : public fir::FIROpConversion<fir::AllocMemOp> {
         mlir::IntegerType::get(rewriter.getContext(), mallocTyWidth);
     if (mallocTyWidth != ity.getIntOrFloatBitWidth())
       size = integerCast(loc, rewriter, mallocTy, size);
+
+    mlir::Value c64 = mlir::LLVM::ConstantOp::create(rewriter, loc, mallocTy, 64);
+    mlir::Value c63 = mlir::LLVM::ConstantOp::create(rewriter, loc, mallocTy, 63);
+    mlir::Value cNot63 = mlir::LLVM::ConstantOp::create(rewriter, loc, mallocTy, ~63ULL);
+    // alignedSize = (size + 63) & ~63
+    mlir::Value addSize = mlir::LLVM::AddOp::create(rewriter, loc, mallocTy, size, c63);
+    mlir::Value alignedSize = mlir::LLVM::AndOp::create(rewriter, loc, mallocTy, addSize, cNot63);
+
     heap->setAttr("callee", getMalloc(heap, rewriter, mallocTy));
     rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
-        heap, ::getLlvmPtrType(heap.getContext()), size,
-        addLLVMOpBundleAttrs(rewriter, heap->getAttrs(), 1));
+        heap, ::getLlvmPtrType(heap.getContext()), mlir::ValueRange{c64, alignedSize},
+        addLLVMOpBundleAttrs(rewriter, heap->getAttrs(), 2));
     return mlir::success();
   }
 
