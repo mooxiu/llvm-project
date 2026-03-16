@@ -12,8 +12,6 @@
 
 #include <cassert>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <ffi.h>
 #include <string>
 #include <unordered_map>
@@ -264,7 +262,7 @@ struct GenELF64DeviceTy : public GenericDeviceTy {
     case TARGET_ALLOC_DEVICE:
     case TARGET_ALLOC_HOST:
     case TARGET_ALLOC_SHARED:
-      MemAlloc = std::aligned_alloc(64, Size);
+      MemAlloc = std::malloc(Size);
       break;
     }
     return MemAlloc;
