@@ -36,10 +36,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
-#include "llvm/Support/Casting.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include <cassert>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -51,7 +48,6 @@
 #include <mlir/IR/IRMapping.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/Interfaces/SideEffectInterfaces.h>
-#include <mlir/Pass/PassManager.h>
 #include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <optional>
@@ -74,14 +70,7 @@ public:
   void runOnOperation() override {
     MLIRContext &context = getContext();
     auto moduleOp = getOperation();
-
     SmallVector<omp::TargetOp> targetOps;
-
-    llvm::dbgs() << "\nModule>>>\n";
-    moduleOp.print(llvm::dbgs()); 
-    llvm::dbgs() << "\nModule<<<\n";
-
-
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
     for (auto targetOp : targetOps) {
@@ -99,28 +88,26 @@ public:
       int mapEntrySize = mapVarsMutable.size();
       for (int i = mapEntrySize - 1; i >= 0; i--) {
         auto arg = block.getArgument(i);
-        llvm::dbgs() << "\n currently dealing with:\n";
-        // arg.print(llvm::dbgs());
-        llvm::dbgs() << "-----------";
-        arg.printAsOperand(llvm::dbgs(), {});
-        llvm::dbgs() << "\n";
-
-        bool isTemporaryVar = true; 
+        // `omp.target` will try to map the outside declaration of all variables used in the omp region,
+        // even if it is declared as private here. 
+        // In such case, it will be shadowed by the `fir::alloca` declared inside of targetOp region,
+        // becoming dead code. We need to clean it up so the host will not try to alloc memory and transferring to device.
+        bool isShadowedByPrivateVar = true; 
         for (auto* userOp : arg.getUsers()) {
           auto dOp = llvm::dyn_cast<hlfir::DeclareOp>(userOp);
           if (dOp) {
             // If one of its result get used, can not delete
             if (!dOp.getResult(0).use_empty() || !dOp.getResult(1).use_empty()) {
-              isTemporaryVar = false;
+              isShadowedByPrivateVar = false;
               break;
             }
           } else {
-            isTemporaryVar = false;
+            isShadowedByPrivateVar = false;
             break;
           }
         }
 
-        if (isTemporaryVar) {
+        if (isShadowedByPrivateVar) {
           // Delete the extra declare before delete the arg itself
           for (auto* userOp: arg.getUsers()) {
             userOp->erase();
