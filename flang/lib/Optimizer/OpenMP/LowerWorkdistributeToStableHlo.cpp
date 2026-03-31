@@ -25,6 +25,7 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/Passes.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/OpenMP/Utils.h"
 #include "flang/Optimizer/Transforms/Passes.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -35,7 +36,10 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cassert>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -47,6 +51,7 @@
 #include <mlir/IR/IRMapping.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/Interfaces/SideEffectInterfaces.h>
+#include <mlir/Pass/PassManager.h>
 #include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <optional>
@@ -71,6 +76,12 @@ public:
     auto moduleOp = getOperation();
 
     SmallVector<omp::TargetOp> targetOps;
+
+    llvm::dbgs() << "\nModule>>>\n";
+    moduleOp.print(llvm::dbgs()); 
+    llvm::dbgs() << "\nModule<<<\n";
+
+
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
     for (auto targetOp : targetOps) {
@@ -80,6 +91,44 @@ public:
               .wasInterrupted() == false) {
         LDBG() << "Ignoring non-workdistribute target op:\n" << *targetOp;
         continue;
+      }
+
+      auto &region = targetOp.getRegion();
+      auto &block = region.front();
+      auto mapVarsMutable = targetOp.getMapVarsMutable();
+      int mapEntrySize = mapVarsMutable.size();
+      for (int i = mapEntrySize - 1; i >= 0; i--) {
+        auto arg = block.getArgument(i);
+        llvm::dbgs() << "\n currently dealing with:\n";
+        // arg.print(llvm::dbgs());
+        llvm::dbgs() << "-----------";
+        arg.printAsOperand(llvm::dbgs(), {});
+        llvm::dbgs() << "\n";
+
+        bool isTemporaryVar = true; 
+        for (auto* userOp : arg.getUsers()) {
+          auto dOp = llvm::dyn_cast<hlfir::DeclareOp>(userOp);
+          if (dOp) {
+            // If one of its result get used, can not delete
+            if (!dOp.getResult(0).use_empty() || !dOp.getResult(1).use_empty()) {
+              isTemporaryVar = false;
+              break;
+            }
+          } else {
+            isTemporaryVar = false;
+            break;
+          }
+        }
+
+        if (isTemporaryVar) {
+          // Delete the extra declare before delete the arg itself
+          for (auto* userOp: arg.getUsers()) {
+            userOp->erase();
+          } 
+
+          block.eraseArgument(i);
+          mapVarsMutable.erase(i);
+        }
       }
 
       std::string str;
