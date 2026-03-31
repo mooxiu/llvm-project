@@ -70,6 +70,7 @@ public:
   void runOnOperation() override {
     MLIRContext &context = getContext();
     auto moduleOp = getOperation();
+
     SmallVector<omp::TargetOp> targetOps;
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
