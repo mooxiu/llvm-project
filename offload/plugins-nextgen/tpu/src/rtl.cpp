@@ -126,7 +126,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   Error unloadBinaryImpl(DeviceImageTy *Image) override {
     llvm_unreachable("TPUDeviceTy unloadBinaryImpl");
-    assert(Context && "Invalid CUDA context");
     return Plugin::success();
   }
 
