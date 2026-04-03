@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <dlfcn.h>
 #include <iostream>
 #include <string>
@@ -51,6 +52,9 @@ struct TPUDeviceTy;
 struct TPUPluginTy;
 
 struct TPUDeviceImageTy : public DeviceImageTy {
+  TPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
+                   std::unique_ptr<MemoryBuffer> Image)
+      : DeviceImageTy(ImageId, Device, std::move(Image)) {}
 };
 
 /// Class implementing the CUDA kernel functionalities which derives from the
@@ -60,7 +64,6 @@ struct TPUKernelTy : public GenericKernelTy {
 
   Error initImpl(GenericDeviceTy &GenericDevice,
                  DeviceImageTy &Image) override {
-    llvm_unreachable("TPU Kernel Ty, initImpl!");
     return Plugin::success();
   }
 
@@ -151,7 +154,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
   }
 
   Expected<GenericKernelTy &> constructKernel(const char *Name) override {
-    llvm_unreachable("TPUDeviceTy constructKernel");
     TPUKernelTy *TPUKernel = Plugin.allocate<TPUKernelTy>();
     if (!TPUKernel)
       return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
@@ -171,15 +173,13 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// NVIDIA returns the product of the SM count and the number of warps that
   /// fit if the maximum number of threads were scheduled on each SM.
   uint64_t getHardwareParallelism() const override {
-    llvm_unreachable("TPUDeviceTy getHardwareParallelism");
     return HardwareParallelism;
   }
 
   /// We want to set up the RPC server for host services to the GPU if it is
   /// available.
   bool shouldSetupRPCServer() const override { 
-    llvm_unreachable("TPUDeviceTy shouldSetupRPCServer");
-    return true; }
+    return false; }
 
   /// The RPC interface should have enough space for all available parallelism.
   uint64_t requestedRPCPortCount() const override {
@@ -189,13 +189,16 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Allocate memory on the device or related to the device.
   Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override {
-    llvm_unreachable("TPUDeviceTy allocate");
-    return nullptr;
+    void *ptr = std::malloc(Size);
+    if (!ptr) {
+      return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
+    }
+    return ptr;
   }
 
   /// Deallocate memory on the device or related to the device.
   Error free(void *TgtPtr, TargetAllocTy Kind) override {
-    llvm_unreachable("TPUDeviceTy free");
+    std::free(TgtPtr);
     return Plugin::success();
   }
 
@@ -236,19 +239,19 @@ struct TPUDeviceTy : public GenericDeviceTy {
   Expected<bool> isPinnedPtrImpl(void *HstPtr, void *&BaseHstPtr,
                                  void *&BaseDevAccessiblePtr,
                                  size_t &BaseSize) const override {
-    llvm_unreachable("TPUDeviceTy isPinnedPtrImpl");
+    return false;
   }
 
   /// Submit data to the device (host to device transfer).
   Error dataSubmitImpl(void *TgtPtr, const void *HstPtr, int64_t Size,
                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    llvm_unreachable("TPUDeviceTy dataSubmitImpl");
+    return Plugin::success();
   }
 
   /// Retrieve data from the device (device to host transfer).
   Error dataRetrieveImpl(void *HstPtr, const void *TgtPtr, int64_t Size,
                          AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    llvm_unreachable("TPUDeviceTy dataRetrieveImpl");
+    return Plugin::success();
    }
 
   /// Exchange data between two devices directly. We may use peer access if
@@ -307,18 +310,18 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Create an event.
   Error createEventImpl(void **EventPtrStorage) override {
-    llvm_unreachable("TPUDeviceTy createEventImpl");
+    return Plugin::success();
   }
 
   /// Make the stream wait on the event.
   Error waitEventImpl(void *EventPtr,
                       AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    llvm_unreachable("TPUDeviceTy waitEventImpl");
+    return Plugin::success();
   }
 
   Expected<bool> isEventCompleteImpl(void *EventPtr,
                                      AsyncInfoWrapperTy &) override {
-    llvm_unreachable("TPUDeviceTy isEventCompleteImpl");
+    return true;
   }
 
   /// Print information about the device.
@@ -328,7 +331,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Getters and setters for stack and heap sizes.
   Error getDeviceStackSize(uint64_t &Value) override {
-    llvm_unreachable("TPUDeviceTy getDeviceStackSize");
+    Value = 0;
+    return Plugin::success();
   }
   Error setDeviceStackSize(uint64_t Value) override {
     llvm_unreachable("TPUDeviceTy setDeviceStackSize");
@@ -337,13 +341,15 @@ struct TPUDeviceTy : public GenericDeviceTy {
     return true; 
   }
   Error getDeviceHeapSize(uint64_t &Value) override {
-    llvm_unreachable("TPUDeviceTy getDeviceHeapSize");
+    Value = 0;
+    return Plugin::success();
   }
   Error setDeviceHeapSize(uint64_t Value) override {
     llvm_unreachable("TPUDeviceTy setDeviceHeapSize");
   }
   Error getDeviceMemorySize(uint64_t &Value) override {
-    llvm_unreachable("TPUDeviceTy getDeviceMemorySize");
+    Value = 80ULL << 30; // 80GB
+    return Plugin::success();
   }
 
   Error getDeviceAttr(uint32_t Kind, uint32_t &Value) {
@@ -357,12 +363,47 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Returns the clock frequency for the given NVPTX device.
   uint64_t getClockFrequency() const override { 
-    llvm_unreachable("TPUDeviceTy getClockFrequency");
     return 1000000000; }
 
   Error callGlobalCtorDtorCommon(GenericPluginTy &Plugin, DeviceImageTy &Image,
                                  bool IsCtor) {
-    llvm_unreachable("TPUDeviceTy callGlobalCtorDtorCommon");
+    return Plugin::success();
+  }
+
+  Expected<DeviceImageTy *>
+  loadBinaryImpl(std::unique_ptr<MemoryBuffer> &&TgtImage,
+                 int32_t ImageId) override {
+    TPUDeviceImageTy *TPUImage = Plugin.allocate<TPUDeviceImageTy>();
+    if (!TPUImage)
+      return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
+                           "Failed to allocate memory for TPU Device Image");
+    new (TPUImage) TPUDeviceImageTy(ImageId, *this, std::move(TgtImage));
+    return TPUImage;
+  }
+
+  Error destroyEventImpl(void *EventPtr) override {
+    return Plugin::success();
+  }
+
+  Error recordEventImpl(void *EventPtr,
+                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    return Plugin::success();
+  }
+
+  Error syncEventImpl(void *EventPtr) override {
+    return Plugin::success();
+  }
+
+  Expected<bool> hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    return false; 
+  }
+
+  bool useAutoZeroCopyImpl() override {
+    return false; 
+  }
+
+  Expected<bool> isAccessiblePtrImpl(const void *Ptr, size_t Size) override {
+    return false; 
   }
 
   struct ComputeCapabilityTy {
@@ -382,7 +423,18 @@ Error TPUKernelTy::delegatedLaunchImpl(
     GenericDeviceTy &GenericDevice,
     std::function<int64_t(void *)> &DelegatedLaunch,
     AsyncInfoWrapperTy &AsyncInfoWrapper) const {
-  llvm_unreachable("delegatedLaunchImpl");
+  TPUDeviceTy &TPUDevice = static_cast<TPUDeviceTy &>(GenericDevice);
+  // TPUPluginTy &TPUPlugin = static_cast<TPUPluginTy &>(TPUDevice.Plugin);
+  Plugin::DelegatedLaunchArgs DLA{
+      Plugin::DelegatedLaunchArgs::DeviceTyTy::TPU, 
+      &TPUDevice,                                    
+      nullptr
+      // TPUPlugin->PjrtClient          
+  };
+  int64_t Res = DelegatedLaunch(&DLA);
+  if (Res)
+    return Plugin::error(ErrorCode::UNSUPPORTED, "Error in TPU delegated launch");
+  return Plugin::success();
 }
 
 Error TPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
@@ -390,7 +442,7 @@ Error TPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
                                KernelArgsTy &KernelArgs,
                                KernelLaunchParamsTy LaunchParams,
                                AsyncInfoWrapperTy &AsyncInfoWrapper) const {
-  llvm_unreachable("TPUKernelTy::launchImpl");
+  return Plugin::success();
 }
 
 class TPUGlobalHandlerTy final : public GenericGlobalHandlerTy {
@@ -516,7 +568,6 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   /// Deinitialize the plugin.
   Error deinitImpl() override {
-    llvm_unreachable("deinitImpl");
     return Plugin::success(); }
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
