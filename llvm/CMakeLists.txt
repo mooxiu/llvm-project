@@ -548,6 +548,7 @@ set(LLVM_ALL_TARGETS
   WebAssembly
   X86
   XCore
+  TPU
   )
 
 set(LLVM_ALL_EXPERIMENTAL_TARGETS
