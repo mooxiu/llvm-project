@@ -12,6 +12,8 @@
 
 #include <cassert>
 #include <cstddef>
+#include <dlfcn.h>
+#include <iostream>
 #include <string>
 #include "../dynamic_tpu/pjrt_c_api.h"
 #include <unordered_map>
@@ -29,6 +31,7 @@
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPGridValues.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileOutputBuffer.h"
@@ -120,98 +123,31 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Initialize the device, its resources and get its properties.
   Error initImpl(GenericPluginTy &Plugin) override {
-    llvm_unreachable("TPUDeviceTy initImpl");
     return Plugin::success();
   }
 
   Error unloadBinaryImpl(DeviceImageTy *Image) override {
-    llvm_unreachable("TPUDeviceTy unloadBinaryImpl");
     return Plugin::success();
   }
 
   /// Deinitialize the device and release its resources.
   Error deinitImpl() override {
-    llvm_unreachable("TPUDeviceTy deinitImpl");
     return Plugin::success();
   }
 
   virtual Error callGlobalConstructors(GenericPluginTy &Plugin,
                                        DeviceImageTy &Image) override {
-    llvm_unreachable("TPUDeviceTy callGlobalConstructors");
     return callGlobalCtorDtorCommon(Plugin, Image, /*IsCtor=*/true);
   }
 
   virtual Error callGlobalDestructors(GenericPluginTy &Plugin,
                                       DeviceImageTy &Image) override {
-    llvm_unreachable("TPUDeviceTy callGlobalDestructors");
     return callGlobalCtorDtorCommon(Plugin, Image, /*IsCtor=*/false);
   }
 
   Expected<std::unique_ptr<MemoryBuffer>>
-  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const {
+  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const override{
     llvm_unreachable("TPUDeviceTy doJITPostProcessing");
-    // TODO: We should be able to use the 'nvidia-ptxjitcompiler' interface to
-    //       avoid the call to 'ptxas'.
-    SmallString<128> PTXInputFilePath;
-    std::error_code EC = sys::fs::createTemporaryFile("nvptx-pre-link-jit", "s",
-                                                      PTXInputFilePath);
-    if (EC)
-      return Plugin::error(ErrorCode::HOST_IO,
-                           "failed to create temporary file for ptxas");
-
-    // Write the file's contents to the output file.
-    Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
-        FileOutputBuffer::create(PTXInputFilePath, MB->getBuffer().size());
-    if (!OutputOrErr)
-      return OutputOrErr.takeError();
-    std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
-    llvm::copy(MB->getBuffer(), Output->getBufferStart());
-    if (Error E = Output->commit())
-      return std::move(E);
-
-    SmallString<128> PTXOutputFilePath;
-    EC = sys::fs::createTemporaryFile("nvptx-post-link-jit", "cubin",
-                                      PTXOutputFilePath);
-    if (EC)
-      return Plugin::error(ErrorCode::HOST_IO,
-                           "failed to create temporary file for ptxas");
-
-    // Try to find `ptxas` in the path to compile the PTX to a binary.
-    const auto ErrorOrPath = sys::findProgramByName("ptxas");
-    if (!ErrorOrPath)
-      return Plugin::error(ErrorCode::HOST_TOOL_NOT_FOUND,
-                           "failed to find 'ptxas' on the PATH.");
-
-    std::string Arch = getComputeUnitKind();
-    StringRef Args[] = {*ErrorOrPath,
-                        "-m64",
-                        "-O2",
-                        "--gpu-name",
-                        Arch,
-                        "--output-file",
-                        PTXOutputFilePath,
-                        PTXInputFilePath};
-
-    std::string ErrMsg;
-    if (sys::ExecuteAndWait(*ErrorOrPath, Args, std::nullopt, {}, 0, 0,
-                            &ErrMsg))
-      return Plugin::error(ErrorCode::ASSEMBLE_FAILURE,
-                           "running 'ptxas' failed: %s\n", ErrMsg.c_str());
-
-    auto BufferOrErr = MemoryBuffer::getFileOrSTDIN(PTXOutputFilePath.data());
-    if (!BufferOrErr)
-      return Plugin::error(ErrorCode::HOST_IO,
-                           "failed to open temporary file for ptxas");
-
-    // Clean up the temporary files afterwards.
-    if (sys::fs::remove(PTXOutputFilePath))
-      return Plugin::error(ErrorCode::HOST_IO,
-                           "failed to remove temporary file for ptxas");
-    if (sys::fs::remove(PTXInputFilePath))
-      return Plugin::error(ErrorCode::HOST_IO,
-                           "failed to remove temporary file for ptxas");
-
-    return std::move(*BufferOrErr);
   }
 
   Expected<GenericKernelTy &> constructKernel(const char *Name) override {
@@ -465,21 +401,116 @@ public:
   Error getGlobalMetadataFromDevice(GenericDeviceTy &Device,
                                     DeviceImageTy &Image,
                                     GlobalTy &DeviceGlobal) override {
-    llvm_unreachable("getGlobalMetadataFromDevice");
+    DeviceGlobal.setPtr(nullptr);
     return Plugin::success();
   }
 };
 
 struct TPUPluginTy final : public GenericPluginTy {
+  PJRT_Api PjrtApi;
+  PJRT_Client* PjrtClient = nullptr;
+  PJRT_Device* PjrtDevice = nullptr;
+
   TPUPluginTy() : GenericPluginTy(getTripleArch()) {}
 
   /// This class should not be copied.
   TPUPluginTy(const TPUPluginTy &) = delete;
   TPUPluginTy(TPUPluginTy &&) = delete;
 
+
+  std::string getDeviceDescription(const PJRT_Api *api, PJRT_Device *device) {
+    PJRT_Device_GetDescription_Args args = {
+      .struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE,
+      .device = device,
+    };
+    auto err1 = api->PJRT_Device_GetDescription(&args);
+    if (err1) {
+      std::cerr << "Error in getting description!\n";
+      return nullptr;
+    }
+    PJRT_DeviceDescription_ToString_Args ts_args = {
+      .struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE,
+      .device_description = args.device_description,
+    };
+    auto err2 = api->PJRT_DeviceDescription_ToString(&ts_args);
+    if (err2) {
+      std::cerr << "Error in getting description to string!\n";
+      return nullptr;
+    }
+    return ts_args.to_string;
+  }
+
+  // Get the target device handle
+  PJRT_Device *findDevice(const PJRT_Api *api, PJRT_Client *client,
+                          const std::string &deviceDescKeyword) {
+    PJRT_Client_AddressableDevices_Args device_args = {
+      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
+      .client = client,
+    };
+    auto err = api->PJRT_Client_AddressableDevices(&device_args);
+    if (err || device_args.num_addressable_devices < 1) {
+      std::cerr << "no devices found!\n"; 
+      return nullptr;
+    }
+
+    int chosen_device_idx = -1;
+    std::string desc = ""; // for logging purpose
+    for (int i = 0; i < device_args.num_addressable_devices; i++) {
+      std::string tmp = getDeviceDescription(api, device_args.addressable_devices[i]);
+      llvm::dbgs() << "We're getting description like: " << tmp << "\n" ;
+      std::transform(tmp.begin(), tmp.end(), tmp.begin(),[](unsigned char c) { return std::tolower(c); });
+      if (tmp.find(deviceDescKeyword) != std::string::npos) {
+        chosen_device_idx = i;
+        desc = tmp;
+        break;
+      }
+    }
+    if (chosen_device_idx == -1) {
+      std::cerr << "no device found, but why?!\n";
+      return nullptr;
+    }
+    return device_args.addressable_devices[chosen_device_idx];
+  }
+
+
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    llvm_unreachable("initImpl");
+    const char* custom_path = std::getenv("LIBTPU_PATH");
+    void* Handle = nullptr;
+    if (custom_path != nullptr) {
+      Handle =  dlopen(custom_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    } else {
+      Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    }
+    if (!Handle) {
+      std::cerr << "error loading plugin: " << dlerror() << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    // follow the example of `man dlopen`
+    auto GetApiFn = (PJRT_Api * (*)()) dlsym(Handle, "GetPjrtApi");
+    if (!GetApiFn) {
+      std::cerr << "error finding GetPjrtApi: " << dlerror() << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+    PJRT_Api* Api = GetApiFn();
+    assert(Api && "Can not get APi!");
+    PJRT_Plugin_Initialize_Args InitArgs = {};
+    InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
+    auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
+    // Theoretically need to close handle_ when exiting, but it will automatically be destroyed when exiting the program so intentionally leave it.
+    PJRT_Client_Create_Args args = {
+      .struct_size= PJRT_Client_Create_Args_STRUCT_SIZE
+    };
+    auto* error = Api->PJRT_Client_Create(&args);
+    if (error) {
+      std::cerr << "Fail to create client!\n";
+      std::exit(EXIT_FAILURE);
+    }
+    this->PjrtClient = args.client;
+    auto device = findDevice(Api, PjrtClient, "cuda");
+    this->PjrtDevice = device;
+    // Should return number of devices
+    //
     return 1;
   }
 
@@ -490,17 +521,16 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    llvm_unreachable("createDevice");
+    return new TPUDeviceTy(Plugin, DeviceId, NumDevices);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {
-    llvm_unreachable("createGlobalHandler");
     return new TPUGlobalHandlerTy();
   }
 
   /// Get the ELF code for recognizing the compatible image binary.
   uint16_t getMagicElfBits() const override { 
-    llvm_unreachable("getMagicElfBits");
+    return ELF::EM_X86_64;
   }
 
   Triple::ArchType getTripleArch() const override {
@@ -508,12 +538,11 @@ struct TPUPluginTy final : public GenericPluginTy {
   }
 
   const char *getName() const override { 
-    llvm_unreachable("getName");
     return GETNAME(TARGET_NAME); }
 
   Expected<bool> isELFCompatible(uint32_t DeviceId,
                                  StringRef Image) const override {
-    llvm_unreachable("isELFCompatible");
+    return true;
   }
 };
 

@@ -19,6 +19,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/TypeRange.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/TargetParser/Triple.h"
+#include <memory>
 
 #define DEBUG_TYPE "flang-codegen-target"
 
@@ -1477,6 +1479,57 @@ struct TargetAMDGPU : public GenericTarget<TargetAMDGPU> {
 };
 } // namespace
 
+
+//===----------------------------------------------------------------------===//
+// TPU linux target specifics.
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TargetTPU: public GenericTarget<TargetAMDGPU> {
+  using GenericTarget::GenericTarget;
+
+  // Default size (in bits) of the index type for strings.
+  static constexpr int defaultWidth = 64;
+
+  CodeGenSpecifics::Marshalling
+  complexArgumentType(mlir::Location loc, mlir::Type eleTy) const override {
+    CodeGenSpecifics::Marshalling marshal;
+    const auto *sem = &floatToSemantics(kindMap, eleTy);
+    if (sem == &llvm::APFloat::IEEEsingle()) {
+      // Lower COMPLEX(KIND=4) as an array of two element values.
+      marshal.emplace_back(fir::SequenceType::get({2}, eleTy), AT{});
+    } else if (sem == &llvm::APFloat::IEEEdouble()) {
+      // Pass COMPLEX(KIND=8) as two separate arguments.
+      marshal.emplace_back(eleTy, AT{});
+      marshal.emplace_back(eleTy, AT{});
+    } else {
+      typeTodo(sem, loc, "argument");
+    }
+    return marshal;
+  }
+
+  CodeGenSpecifics::Marshalling
+  complexReturnType(mlir::Location loc, mlir::Type eleTy) const override {
+    CodeGenSpecifics::Marshalling marshal;
+    const auto *sem = &floatToSemantics(kindMap, eleTy);
+    if (sem == &llvm::APFloat::IEEEsingle()) {
+      // Return COMPLEX(KIND=4) as an array of two elements.
+      marshal.emplace_back(fir::SequenceType::get({2}, eleTy), AT{});
+    } else if (sem == &llvm::APFloat::IEEEdouble()) {
+      // Return COMPLEX(KIND=8) via an aggregate with two fields.
+      marshal.emplace_back(mlir::TupleType::get(eleTy.getContext(),
+                                                mlir::TypeRange{eleTy, eleTy}),
+                           AT{});
+    } else {
+      typeTodo(sem, loc, "return");
+    }
+    return marshal;
+  }
+};
+} // namespace
+
+
+
 //===----------------------------------------------------------------------===//
 // NVPTX linux target specifics.
 //===----------------------------------------------------------------------===//
@@ -1953,6 +2006,9 @@ fir::CodeGenSpecifics::get(mlir::MLIRContext *ctx, llvm::Triple &&trp,
         ctx, std::move(trp), std::move(kindMap), targetCPU, targetFeatures, dl);
   case llvm::Triple::ArchType::loongarch64:
     return std::make_unique<TargetLoongArch64>(
+        ctx, std::move(trp), std::move(kindMap), targetCPU, targetFeatures, dl);
+  case llvm::Triple::ArchType::tpu:
+    return std::make_unique<TargetTPU>(
         ctx, std::move(trp), std::move(kindMap), targetCPU, targetFeatures, dl);
   }
   TODO(mlir::UnknownLoc::get(ctx), "target not implemented");

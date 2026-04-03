@@ -1,4 +1,4 @@
-#include "TargetInfo/TPUTargetInfo.h"
+#include "TPUTargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 
@@ -10,6 +10,9 @@ Target &llvm::getTheTPUTarget() {
 }
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeTPUTargetInfo() {
-  RegisterTarget<Triple::ve, /*HasJIT=*/false> X(getTheTPUTarget(), "tpu",
+  RegisterTarget<Triple::tpu, /*HasJIT=*/false> X(getTheTPUTarget(), "tpu",
                                                  "TPU", "TPU");
+}
+
+extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeTPUTargetMC() {
 }
