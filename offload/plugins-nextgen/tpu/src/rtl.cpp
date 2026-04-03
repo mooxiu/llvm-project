@@ -148,7 +148,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
   }
 
   Expected<std::unique_ptr<MemoryBuffer>>
-  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const override {
+  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const {
     llvm_unreachable("TPUDeviceTy doJITPostProcessing");
     // TODO: We should be able to use the 'nvidia-ptxjitcompiler' interface to
     //       avoid the call to 'ptxas'.

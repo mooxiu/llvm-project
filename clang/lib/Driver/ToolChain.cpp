@@ -35,6 +35,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/OptTable.h"
 #include "llvm/Option/Option.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
@@ -520,6 +521,7 @@ ToolChain::getTargetAndModeFromProgramName(StringRef PN) {
   Prefix = Prefix.slice(0, LastComponent);
   std::string IgnoredError;
 
+  llvm::dbgs() << "\n Currently getting prefix" << Prefix << "\n";
   llvm::Triple Triple(Prefix);
   bool IsRegistered = llvm::TargetRegistry::lookupTarget(Triple, IgnoredError);
   return ParsedClangName{std::string(Prefix), ModeSuffix, DS->ModeFlag,
