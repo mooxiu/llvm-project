@@ -650,6 +650,7 @@ static Triple::ArchType parseArch(StringRef ArchName) {
           .Case("renderscript32", Triple::renderscript32)
           .Case("renderscript64", Triple::renderscript64)
           .Case("shave", Triple::shave)
+          .Case("tpu", Triple::tpu)
           .Case("ve", Triple::ve)
           .Case("wasm32", Triple::wasm32)
           .Case("wasm64", Triple::wasm64)
