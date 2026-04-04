@@ -118,7 +118,7 @@ if(DEFINED LIBOMPTARGET_BUILD_CUDA_PLUGIN OR
   message(WARNING "Option removed, use 'LIBOMPTARGET_PLUGINS_TO_BUILD' instead")
 endif()
 
-set(LIBOMPTARGET_ALL_PLUGIN_TARGETS amdgpu cuda)
+set(LIBOMPTARGET_ALL_PLUGIN_TARGETS amdgpu cuda tpu host)
 set(LIBOMPTARGET_PLUGINS_TO_BUILD "all" CACHE STRING
     "Semicolon-separated list of plugins to use: cuda, amdgpu, level_zero, or \"all\".")
 
