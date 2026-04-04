@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <iostream>
 #include <string>
@@ -27,6 +28,7 @@
 #include "OpenMP/OMPT/Callback.h"
 #include "PluginInterface.h"
 #include "Utils/ELF.h"
+#include "omptarget.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -119,8 +121,18 @@ struct TPUEventRef final : public GenericDeviceResourceRef {
 };
 
 struct TPUDeviceTy : public GenericDeviceTy {
-  TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices)
-      : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues) {}
+  const PJRT_Api* pjrtApi;
+  PJRT_Client* pjrtCleint;
+  PJRT_Device* pjrtDevice;
+  std::unordered_map<void*, PJRT_Buffer*> dveiceBufferMap;
+
+
+  TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
+              PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
+      : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
+        pjrtApi(Api), pjrtCleint(Client), pjrtDevice(Device) {
+    printf("\nTPUDeviceTy init success!\n");
+  }
 
   ~TPUDeviceTy() {}
 
@@ -189,16 +201,54 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Allocate memory on the device or related to the device.
   Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override {
-    void *ptr = std::malloc(Size);
-    if (!ptr) {
-      return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
+    printf("\nStart to allocate!\n");
+    void* ptr = nullptr;
+    switch (Kind) {
+      case TargetAllocTy::TARGET_ALLOC_DEFAULT:
+      case TargetAllocTy::TARGET_ALLOC_DEVICE: {
+        int64_t dims[1] = { static_cast<int64_t>(Size) };
+        auto args = PJRT_Client_CreateUninitializedBuffer_Args{
+          .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
+          .client = this->pjrtCleint,
+          .device = this->pjrtDevice,
+          .memory = nullptr,
+          .shape_dims = dims,
+          .shape_num_dims = 1,
+          .shape_element_type = PJRT_Buffer_Type_S8,
+          .shape_layout = nullptr
+        }; 
+        auto err = this->pjrtApi->PJRT_Client_CreateUninitializedBuffer(&args);
+        if (err) {
+          std::cerr << "Fail!\n";
+          exit(1);
+        }
+        
+        auto args2 = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args{
+          .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
+          .buffer = args.buffer
+        };
+        err = this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&args2);
+        if (err) {
+          std::cerr << "Fail in getting pointer!\n";
+          exit(1);
+        }
+        ptr = args2.device_memory_ptr;
+        this->dveiceBufferMap[ptr] = args2.buffer;
+        break;
+      }
+      case TargetAllocTy::TARGET_ALLOC_HOST:
+      case TargetAllocTy::TARGET_ALLOC_SHARED: {
+        ptr = std::malloc(Size);
+          if (!ptr) {
+        return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
+      }
+      }
     }
     return ptr;
   }
 
   /// Deallocate memory on the device or related to the device.
   Error free(void *TgtPtr, TargetAllocTy Kind) override {
-    std::free(TgtPtr);
     return Plugin::success();
   }
 
@@ -459,9 +509,8 @@ public:
 };
 
 struct TPUPluginTy final : public GenericPluginTy {
-  PJRT_Api PjrtApi;
+  PJRT_Api* PjrtApi;
   PJRT_Client* PjrtClient = nullptr;
-  PJRT_Device* PjrtDevice = nullptr;
 
   TPUPluginTy() : GenericPluginTy(getTripleArch()) {}
 
@@ -558,11 +607,9 @@ struct TPUPluginTy final : public GenericPluginTy {
       std::cerr << "Fail to create client!\n";
       std::exit(EXIT_FAILURE);
     }
+    this->PjrtApi = Api;
     this->PjrtClient = args.client;
-    auto device = findDevice(Api, PjrtClient, "cuda");
-    this->PjrtDevice = device;
-    // Should return number of devices
-    //
+    printf("\nPlugin init success!\n");
     return 1;
   }
 
@@ -572,7 +619,10 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    return new TPUDeviceTy(Plugin, DeviceId, NumDevices);
+    auto device = findDevice(this->PjrtApi, this->PjrtClient, "cuda");
+    return new TPUDeviceTy(
+      Plugin, DeviceId, NumDevices, 
+      this->PjrtApi, this->PjrtClient, device);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {
