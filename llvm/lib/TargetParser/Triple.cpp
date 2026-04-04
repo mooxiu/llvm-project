@@ -1765,7 +1765,6 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
   case llvm::Triple::ve:
   case llvm::Triple::wasm64:
   case llvm::Triple::x86_64:
-  case llvm::Triple::tpu:
     return 64;
   }
   llvm_unreachable("Invalid architecture value");
