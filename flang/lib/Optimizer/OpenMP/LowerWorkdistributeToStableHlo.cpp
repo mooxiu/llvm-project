@@ -25,6 +25,7 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/Passes.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/OpenMP/Utils.h"
 #include "flang/Optimizer/Transforms/Passes.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -80,6 +81,42 @@ public:
               .wasInterrupted() == false) {
         LDBG() << "Ignoring non-workdistribute target op:\n" << *targetOp;
         continue;
+      }
+
+      auto &region = targetOp.getRegion();
+      auto &block = region.front();
+      auto mapVarsMutable = targetOp.getMapVarsMutable();
+      int mapEntrySize = mapVarsMutable.size();
+      for (int i = mapEntrySize - 1; i >= 0; i--) {
+        auto arg = block.getArgument(i);
+        // `omp.target` will try to map the outside declaration of all variables used in the omp region,
+        // even if it is declared as private here. 
+        // In such case, it will be shadowed by the `fir::alloca` declared inside of targetOp region,
+        // becoming dead code. We need to clean it up so the host will not try to alloc memory and transferring to device.
+        bool isShadowedByPrivateVar = true; 
+        for (auto* userOp : arg.getUsers()) {
+          auto dOp = llvm::dyn_cast<hlfir::DeclareOp>(userOp);
+          if (dOp) {
+            // If one of its result get used, can not delete
+            if (!dOp.getResult(0).use_empty() || !dOp.getResult(1).use_empty()) {
+              isShadowedByPrivateVar = false;
+              break;
+            }
+          } else {
+            isShadowedByPrivateVar = false;
+            break;
+          }
+        }
+
+        if (isShadowedByPrivateVar) {
+          // Delete the extra declare before delete the arg itself
+          for (auto* userOp: arg.getUsers()) {
+            userOp->erase();
+          } 
+
+          block.eraseArgument(i);
+          mapVarsMutable.erase(i);
+        }
       }
 
       std::string str;
