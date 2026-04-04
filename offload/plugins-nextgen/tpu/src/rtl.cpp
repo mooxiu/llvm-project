@@ -336,6 +336,26 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// Retrieve data from the device (device to host transfer).
   Error dataRetrieveImpl(void *HstPtr, const void *TgtPtr, int64_t Size,
                          AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    auto it = this->deviceBufferMap.find(const_cast<void*>(TgtPtr));
+    if (it == this->deviceBufferMap.end()) {
+      std::cerr << "This does not exist !\n";
+      exit(1);
+    }
+    auto args = PJRT_Buffer_CopyRawToHost_Args{
+      .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
+      .buffer = it->second,
+      .dst = HstPtr
+    }; 
+    auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
+    assert(!err);
+
+    auto awaitArgs = PJRT_Event_Await_Args{
+      .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+      .event = args.event
+    };
+    auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
+    assert(!err2);
+
     return Plugin::success();
    }
 
