@@ -124,7 +124,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
   const PJRT_Api* pjrtApi;
   PJRT_Client* pjrtCleint;
   PJRT_Device* pjrtDevice;
-  std::unordered_map<void*, PJRT_Buffer*> dveiceBufferMap;
+  std::unordered_map<void*, PJRT_Buffer*> deviceBufferMap;
 
 
   TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
@@ -201,6 +201,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Allocate memory on the device or related to the device.
   Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override {
+
     printf("\nStart to allocate!\n");
     void* ptr = nullptr;
     switch (Kind) {
@@ -222,7 +223,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
           std::cerr << "Fail!\n";
           exit(1);
         }
-        
+
         auto args2 = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args{
           .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
           .buffer = args.buffer
@@ -233,7 +234,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
           exit(1);
         }
         ptr = args2.device_memory_ptr;
-        this->dveiceBufferMap[ptr] = args2.buffer;
+        this->deviceBufferMap[ptr] = args2.buffer;
         break;
       }
       case TargetAllocTy::TARGET_ALLOC_HOST:
@@ -295,6 +296,40 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// Submit data to the device (host to device transfer).
   Error dataSubmitImpl(void *TgtPtr, const void *HstPtr, int64_t Size,
                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    printf("\n Start data submit impl!\n");
+    if (Size == 0)
+      return Plugin::success();
+
+    // auto it = this->deviceBufferMap.find(TgtPtr);
+    // if (it == this->deviceBufferMap.end()) {
+    //   return Plugin::error(ErrorCode::INVALID_ARGUMENT, "Target pointer not found in DeviceBufferMap");
+    // }
+    int64_t dims[1] = { static_cast<int64_t>(Size) };
+    auto args = PJRT_Client_BufferFromHostBuffer_Args{
+      .struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE,
+      .client = this->pjrtCleint,
+      .data = HstPtr,              
+      .type = PJRT_Buffer_Type_S8, 
+      .dims = dims,
+      .num_dims = 1,
+      .byte_strides = nullptr,           
+      .device = this->pjrtDevice,
+      // .host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
+    };
+    auto* err = this->pjrtApi->PJRT_Client_BufferFromHostBuffer(&args);
+    if (err) {
+      std::cerr << "Fail to data submit!\n";
+      exit(1);
+    }
+
+    auto awaitArgs = PJRT_Event_Await_Args {
+      .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+      .event = args.done_with_host_buffer
+    };
+    auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
+    assert(!err2);
+
+    this->deviceBufferMap[TgtPtr] = args.buffer;
     return Plugin::success();
   }
 
