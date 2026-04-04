@@ -39,6 +39,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Program.h"
 
 using namespace error;
@@ -257,7 +258,15 @@ struct TPUDeviceTy : public GenericDeviceTy {
         this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&ptr_args);
         void* AllocPtr = ptr_args.device_memory_ptr;
 
+        printf("\n[TPU Debug] allocate() -> Size: %lu | PjrtBuf: %p | Physical AllocPtr: %p\n", Size, buffer, AllocPtr);
+        if (!AllocPtr) {
+           printf("[TPU Debug] FATAL: PJRT returned a NULL physical pointer! We can't map this.\n");
+           return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "PJRT returned NULL Opaque Pointer");
+        }
+
         ptr = AllocPtr;
+
+
         DeviceBufferMap[ptr] = {buffer, tm};
 
         // int64_t dims[1] = { static_cast<int64_t>(Size) };
@@ -348,9 +357,11 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// Submit data to the device (host to device transfer).
   Error dataSubmitImpl(void *TgtPtr, const void *HstPtr, int64_t Size,
                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    printf("\n Start data submit impl!\n");
-    if (Size == 0)
+    printf("\nStart data submit impl!\n");
+    if (Size == 0 || TgtPtr == nullptr)
       return Plugin::success();
+
+    printf("\nDataSuvmitImpl: TgtPtr: %p\n", TgtPtr);
 
     auto it = DeviceBufferMap.find(TgtPtr);
     if (it == DeviceBufferMap.end()) {
@@ -359,15 +370,16 @@ struct TPUDeviceTy : public GenericDeviceTy {
     }
     PJRT_AsyncHostToDeviceTransferManager* tm = it->second.TransferManager;
 
-    PJRT_AsyncHostToDeviceTransferManager_TransferData_Args transfer_args = {};
-    transfer_args.struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE;
-    transfer_args.transfer_manager = tm;
-    transfer_args.buffer_index = 0;
-    transfer_args.data = HstPtr;
-    transfer_args.offset = 0;
-    transfer_args.transfer_size = Size;
-    
-    transfer_args.is_last_transfer = true; 
+    PJRT_AsyncHostToDeviceTransferManager_TransferData_Args transfer_args = {
+      .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
+      .transfer_manager = tm,
+      .buffer_index = 0,
+      .data = HstPtr,
+      .offset = 0,
+      .transfer_size = Size,
+      .is_last_transfer = true,
+    };
+   
     
     auto* err = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&transfer_args);
     assert(!err);
@@ -424,6 +436,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
     auto args = PJRT_Buffer_CopyRawToHost_Args{
       .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
       .buffer = it->second.PjrtBuf,
+      .transfer_size = Size,     
       .dst = HstPtr
     }; 
     auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
@@ -609,7 +622,6 @@ Error TPUKernelTy::delegatedLaunchImpl(
     std::function<int64_t(void *)> &DelegatedLaunch,
     AsyncInfoWrapperTy &AsyncInfoWrapper) const {
   TPUDeviceTy &TPUDevice = static_cast<TPUDeviceTy &>(GenericDevice);
-  // TPUPluginTy &TPUPlugin = static_cast<TPUPluginTy &>(TPUDevice.Plugin);
   Plugin::DelegatedLaunchArgs DLA{
       Plugin::DelegatedLaunchArgs::DeviceTyTy::TPU, 
       &TPUDevice,                                    
@@ -617,6 +629,7 @@ Error TPUKernelTy::delegatedLaunchImpl(
       // TPUPlugin->PjrtClient          
   };
   int64_t Res = DelegatedLaunch(&DLA);
+  // std::this_thread::sleep_for(std::chrono::seconds(10));
   if (Res)
     return Plugin::error(ErrorCode::UNSUPPORTED, "Error in TPU delegated launch");
   return Plugin::success();
@@ -638,7 +651,6 @@ public:
   Error getGlobalMetadataFromDevice(GenericDeviceTy &Device,
                                     DeviceImageTy &Image,
                                     GlobalTy &DeviceGlobal) override {
-    DeviceGlobal.setPtr(nullptr);
     return Plugin::success();
   }
 };
