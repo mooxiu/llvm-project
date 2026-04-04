@@ -1336,8 +1336,7 @@ static bool parseOpenMPArgs(CompilerInvocation &res, llvm::opt::ArgList &args,
           !(tt.getArch() == llvm::Triple::aarch64 || tt.isPPC() ||
             tt.getArch() == llvm::Triple::systemz ||
             tt.getArch() == llvm::Triple::x86 ||
-            tt.getArch() == llvm::Triple::x86_64 || tt.isGPU() ||
-            tt.getArch() == llvm::Triple::tpu))
+            tt.getArch() == llvm::Triple::x86_64 || tt.isGPU())
         diags.Report(clang::diag::err_drv_invalid_omp_target)
             << arg->getValue(i);
       else if (getArchPtrSize(t) != getArchPtrSize(tt))

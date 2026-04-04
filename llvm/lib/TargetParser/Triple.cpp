@@ -11,7 +11,6 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/CodeGen.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/SwapByteOrder.h"
 #include "llvm/Support/VersionTuple.h"
@@ -89,7 +88,6 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
   case x86_64:         return "x86_64";
   case xcore:          return "xcore";
   case xtensa:         return "xtensa";
-  case tpu: return "tpu";
   }
 
   llvm_unreachable("Invalid ArchType!");
@@ -652,7 +650,6 @@ static Triple::ArchType parseArch(StringRef ArchName) {
           .Case("renderscript32", Triple::renderscript32)
           .Case("renderscript64", Triple::renderscript64)
           .Case("shave", Triple::shave)
-          .Case("tpu", Triple::tpu)
           .Case("ve", Triple::ve)
           .Case("wasm32", Triple::wasm32)
           .Case("wasm64", Triple::wasm64)
@@ -1016,7 +1013,6 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
   case Triple::ve:
   case Triple::xcore:
   case Triple::xtensa:
-  case Triple::tpu:
     return Triple::ELF;
 
   case Triple::mipsel:

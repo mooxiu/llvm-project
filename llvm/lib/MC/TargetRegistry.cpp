@@ -142,16 +142,6 @@ const Target *TargetRegistry::lookupTarget(StringRef ArchName,
 const Target *TargetRegistry::lookupTarget(const Triple &TT,
                                            std::string &Error) {
   // Provide special warning when no targets are initialized.
-  llvm::errs() << "=== DEBUG TRIPLE MATCHING ===\n";
-  llvm::errs() << "Input Triple String: " << TT.str() << "\n";
-  llvm::errs() << "Parsed Arch ID (from TT): " << (int)TT.getArch() << "\n";
-  llvm::errs() << "Expected TPU ID (from enum): " << (int)Triple::tpu << "\n";
-
-  for (const Target &T : targets()) {
-    llvm::errs() << " - Target " << T.getName() 
-                 << " ArchMatchFn returns: " << T.ArchMatchFn(TT.getArch()) << "\n";
-  }
-  llvm::errs() << "=============================\n";
   if (targets().begin() == targets().end()) {
     Error = "Unable to find target for this triple (no targets are registered)";
     return nullptr;
