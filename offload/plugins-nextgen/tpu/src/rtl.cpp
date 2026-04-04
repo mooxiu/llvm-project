@@ -41,6 +41,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Program.h"
+#include "llvm/TargetParser/Triple.h"
 
 using namespace error;
 
@@ -129,6 +130,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
   struct PjrtBufferContext {
     PJRT_Buffer* PjrtBuf;
     PJRT_AsyncHostToDeviceTransferManager* TransferManager;
+    bool isRealLast; 
   };
 
   std::unordered_map<void*, PjrtBufferContext> DeviceBufferMap;
@@ -138,7 +140,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
               PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
         pjrtApi(Api), pjrtCleint(Client), pjrtDevice(Device) {
-    printf("\nTPUDeviceTy init success!\n");
+    // printf("\nTPUDeviceTy init success!\n");
   }
 
   ~TPUDeviceTy() {}
@@ -209,10 +211,9 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// Allocate memory on the device or related to the device.
   Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override {
     if (Size == 0) {
-      printf("\n Nothing needs to be allocated!\n");
+      // printf("\n Nothing needs to be allocated!\n");
       return nullptr;
     } 
-    printf("\nStart to allocate!\n");
     void* ptr = nullptr;
     switch (Kind) {
       case TargetAllocTy::TARGET_ALLOC_DEFAULT:
@@ -258,16 +259,16 @@ struct TPUDeviceTy : public GenericDeviceTy {
         this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&ptr_args);
         void* AllocPtr = ptr_args.device_memory_ptr;
 
-        printf("\n[TPU Debug] allocate() -> Size: %lu | PjrtBuf: %p | Physical AllocPtr: %p\n", Size, buffer, AllocPtr);
-        if (!AllocPtr) {
-           printf("[TPU Debug] FATAL: PJRT returned a NULL physical pointer! We can't map this.\n");
-           return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "PJRT returned NULL Opaque Pointer");
-        }
+        // printf("\n[TPU Debug] allocate() -> Size: %lu | PjrtBuf: %p | Physical AllocPtr: %p\n", Size, buffer, AllocPtr);
+        // if (!AllocPtr) {
+        //    printf("[TPU Debug] FATAL: PJRT returned a NULL physical pointer! We can't map this.\n");
+        //    return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "PJRT returned NULL Opaque Pointer");
+        // }
 
         ptr = AllocPtr;
 
 
-        DeviceBufferMap[ptr] = {buffer, tm};
+        DeviceBufferMap[ptr] = {buffer, tm, false};
 
         // int64_t dims[1] = { static_cast<int64_t>(Size) };
         // auto args = PJRT_Client_CreateUninitializedBuffer_Args{
@@ -311,6 +312,32 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
   /// Deallocate memory on the device or related to the device.
   Error free(void *TgtPtr, TargetAllocTy Kind) override {
+    if(!TgtPtr) {
+      return Plugin::success();
+    }
+    auto it = this->DeviceBufferMap.find(TgtPtr);
+    if (it == this->DeviceBufferMap.end()) {
+      return Plugin::success();
+    }
+
+    PjrtBufferContext ctx = it->second;
+    if (ctx.TransferManager) {
+      auto args = PJRT_AsyncHostToDeviceTransferManager_Destroy_Args {
+        .struct_size = PJRT_AsyncHostToDeviceTransferManager_Destroy_Args_STRUCT_SIZE,
+        .transfer_manager = ctx.TransferManager
+      };
+      auto* err1 = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_Destroy(&args);
+      assert(!err1);
+    }
+    if (ctx.PjrtBuf) {
+      auto bufferArgs = PJRT_Buffer_Destroy_Args{
+        .struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE,
+        .buffer = ctx.PjrtBuf,
+      };
+      auto* err2 = this->pjrtApi->PJRT_Buffer_Destroy(&bufferArgs);
+      assert(!err2);
+    }
+    DeviceBufferMap.erase(TgtPtr);
     return Plugin::success();
   }
 
@@ -357,11 +384,9 @@ struct TPUDeviceTy : public GenericDeviceTy {
   /// Submit data to the device (host to device transfer).
   Error dataSubmitImpl(void *TgtPtr, const void *HstPtr, int64_t Size,
                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    printf("\nStart data submit impl!\n");
     if (Size == 0 || TgtPtr == nullptr)
       return Plugin::success();
 
-    printf("\nDataSuvmitImpl: TgtPtr: %p\n", TgtPtr);
 
     auto it = DeviceBufferMap.find(TgtPtr);
     if (it == DeviceBufferMap.end()) {
@@ -418,6 +443,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
     auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
     assert(!err2);
 
+    it->second.isRealLast = true;
+
     return Plugin::success();
   }
 
@@ -425,7 +452,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
   Error dataRetrieveImpl(void *HstPtr, const void *TgtPtr, int64_t Size,
                          AsyncInfoWrapperTy &AsyncInfoWrapper) override {
     if (Size == 0) {
-      printf("\nNothing to be retrieved!\n");
+      // printf("\nNothing to be retrieved!\n");
       return Plugin::success();
     }
     auto it = this->DeviceBufferMap.find(const_cast<void*>(TgtPtr));
@@ -433,6 +460,20 @@ struct TPUDeviceTy : public GenericDeviceTy {
       std::cerr << "This does not exist !\n";
       exit(1);
     }
+    if (!it->second.isRealLast) {
+      int dummy = 0;
+      auto dummyArgs = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args {
+        .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
+        .transfer_manager = it->second.TransferManager,
+        .buffer_index = 0,
+        .data = &dummy,
+        .offset = 0,
+        .transfer_size = 0,
+        .is_last_transfer = true 
+      };
+      this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&dummyArgs);
+    }
+
     auto args = PJRT_Buffer_CopyRawToHost_Args{
       .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
       .buffer = it->second.PjrtBuf,
@@ -756,7 +797,7 @@ struct TPUPluginTy final : public GenericPluginTy {
     }
     this->PjrtApi = Api;
     this->PjrtClient = args.client;
-    printf("\nPlugin init success!\n");
+    // printf("\nPlugin init success!\n");
     return 1;
   }
 
@@ -782,7 +823,8 @@ struct TPUPluginTy final : public GenericPluginTy {
   }
 
   Triple::ArchType getTripleArch() const override {
-    return Triple::tpu;
+    // We actually use x86 here, it does not matter as we will jit execute code rather than compile to TPU target in LLVM
+    return Triple::x86_64;
   }
 
   const char *getName() const override { 
