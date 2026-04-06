@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <iostream>
 #include <string>
@@ -214,106 +215,75 @@ struct TPUDeviceTy : public GenericDeviceTy {
       // printf("\n Nothing needs to be allocated!\n");
       return nullptr;
     } 
-    void* ptr = nullptr;
-    switch (Kind) {
-      case TargetAllocTy::TARGET_ALLOC_DEFAULT:
-      case TargetAllocTy::TARGET_ALLOC_DEVICE: {
-        PJRT_Device_DefaultMemory_Args mem_args = {};
-        mem_args.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
-        mem_args.device = this->pjrtDevice;
-        auto* mem_err = this->pjrtApi->PJRT_Device_DefaultMemory(&mem_args);
-        assert(!mem_err);
-        PJRT_Memory* memory = mem_args.memory;
+    // This is the ptr to the target memory
+    return malloc(Size);
 
-        int64_t dims[1] = { static_cast<int64_t>(Size) };
-        PJRT_ShapeSpec shape_spec = {};
-        shape_spec.struct_size = PJRT_ShapeSpec_STRUCT_SIZE;
-        shape_spec.dims = dims;
-        shape_spec.num_dims = 1;
-        shape_spec.element_type = PJRT_Buffer_Type_S8;
-
-        PJRT_Client_CreateBuffersForAsyncHostToDevice_Args alloc_args = {};
-        alloc_args.struct_size = PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE;
-        alloc_args.client = this->pjrtCleint;
-        alloc_args.shape_specs = &shape_spec;
-        alloc_args.num_shape_specs = 1; 
-        alloc_args.device_layouts = nullptr; 
-        alloc_args.num_device_layouts = 0;
-        alloc_args.memory = memory;
-        
-        auto* alloc_err = this->pjrtApi->PJRT_Client_CreateBuffersForAsyncHostToDevice(&alloc_args);
-        if (alloc_err) return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Failed to create async buffer");
-        
-        PJRT_AsyncHostToDeviceTransferManager* tm = alloc_args.transfer_manager;
-
-        PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args retrieve_args = {};
-        retrieve_args.struct_size = PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args_STRUCT_SIZE;
-        retrieve_args.transfer_manager = tm;
-        retrieve_args.buffer_index = 0; 
-        this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer(&retrieve_args);
-        PJRT_Buffer* buffer = retrieve_args.buffer_out;
-
-        PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args ptr_args = {};
-        ptr_args.struct_size = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args_STRUCT_SIZE;
-        ptr_args.buffer = buffer;
-        this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&ptr_args);
-        void* AllocPtr = ptr_args.device_memory_ptr;
-
-        // printf("\n[TPU Debug] allocate() -> Size: %lu | PjrtBuf: %p | Physical AllocPtr: %p\n", Size, buffer, AllocPtr);
-        // if (!AllocPtr) {
-        //    printf("[TPU Debug] FATAL: PJRT returned a NULL physical pointer! We can't map this.\n");
-        //    return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "PJRT returned NULL Opaque Pointer");
-        // }
-
-        ptr = AllocPtr;
-
-
-        DeviceBufferMap[ptr] = {buffer, tm, false};
-
-        typedef void (*RegBufFn)(void*, PJRT_Buffer*);
-        RegBufFn reg_buf = (RegBufFn)dlsym(RTLD_DEFAULT, "RegisterPjrtBuffer");
-        if (reg_buf) {
-          reg_buf(AllocPtr, buffer); // Sharing with libjit-code-executor 
-        } 
-
-        // int64_t dims[1] = { static_cast<int64_t>(Size) };
-        // auto args = PJRT_Client_CreateUninitializedBuffer_Args{
-        //   .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
-        //   .client = this->pjrtCleint,
-        //   .device = this->pjrtDevice,
-        //   .memory = nullptr,
-        //   .shape_dims = dims,
-        //   .shape_num_dims = 1,
-        //   .shape_element_type = PJRT_Buffer_Type_S8,
-        //   .shape_layout = nullptr
-        // }; 
-        // auto err = this->pjrtApi->PJRT_Client_CreateUninitializedBuffer(&args);
-        // if (err) {
-        //   std::cerr << "Fail!\n";
-        //   exit(1);
-        // }
-        // auto args2 = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args{
-        //   .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
-        //   .buffer = args.buffer
-        // };
-        // err = this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&args2);
-        // if (err) {
-        //   std::cerr << "Fail in getting pointer!\n";
-        //   exit(1);
-        // }
-        // ptr = args2.device_memory_ptr;
-        // this->deviceBufferMap[ptr] = args2.buffer;
-        break;
-      }
-      case TargetAllocTy::TARGET_ALLOC_HOST:
-      case TargetAllocTy::TARGET_ALLOC_SHARED: {
-        ptr = std::malloc(Size);
-          if (!ptr) {
-        return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
-      }
-      }
-    }
-    return ptr;
+    // void* ptr = nullptr;
+    // switch (Kind) {
+    //   case TargetAllocTy::TARGET_ALLOC_DEFAULT:
+    //   case TargetAllocTy::TARGET_ALLOC_DEVICE: {
+    //     PJRT_Device_DefaultMemory_Args mem_args = {};
+    //     mem_args.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
+    //     mem_args.device = this->pjrtDevice;
+    //     auto* mem_err = this->pjrtApi->PJRT_Device_DefaultMemory(&mem_args);
+    //     assert(!mem_err);
+    //     PJRT_Memory* memory = mem_args.memory;
+    //
+    //     int64_t dims[1] = { static_cast<int64_t>(Size) };
+    //     PJRT_ShapeSpec shape_spec = {};
+    //     shape_spec.struct_size = PJRT_ShapeSpec_STRUCT_SIZE;
+    //     shape_spec.dims = dims;
+    //     shape_spec.num_dims = 1;
+    //     shape_spec.element_type = PJRT_Buffer_Type_S8;
+    //
+    //     PJRT_Client_CreateBuffersForAsyncHostToDevice_Args alloc_args = {};
+    //     alloc_args.struct_size = PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE;
+    //     alloc_args.client = this->pjrtCleint;
+    //     alloc_args.shape_specs = &shape_spec;
+    //     alloc_args.num_shape_specs = 1; 
+    //     alloc_args.device_layouts = nullptr; 
+    //     alloc_args.num_device_layouts = 0;
+    //     alloc_args.memory = memory;
+    //
+    //     auto* alloc_err = this->pjrtApi->PJRT_Client_CreateBuffersForAsyncHostToDevice(&alloc_args);
+    //     if (alloc_err) return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Failed to create async buffer");
+    //
+    //     PJRT_AsyncHostToDeviceTransferManager* tm = alloc_args.transfer_manager;
+    //
+    //     PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args retrieve_args = {};
+    //     retrieve_args.struct_size = PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args_STRUCT_SIZE;
+    //     retrieve_args.transfer_manager = tm;
+    //     retrieve_args.buffer_index = 0; 
+    //     this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer(&retrieve_args);
+    //     PJRT_Buffer* buffer = retrieve_args.buffer_out;
+    //
+    //     PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args ptr_args = {};
+    //     ptr_args.struct_size = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args_STRUCT_SIZE;
+    //     ptr_args.buffer = buffer;
+    //     this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&ptr_args);
+    //     void* AllocPtr = ptr_args.device_memory_ptr;
+    //
+    //     ptr = AllocPtr;
+    //
+    //     DeviceBufferMap[ptr] = {buffer, tm, false};
+    //
+    //     typedef void (*RegBufFn)(void*, PJRT_Buffer*);
+    //     RegBufFn reg_buf = (RegBufFn)dlsym(RTLD_DEFAULT, "RegisterPjrtBuffer");
+    //     if (reg_buf) {
+    //       reg_buf(AllocPtr, buffer); // Sharing with libjit-code-executor 
+    //     } 
+    //
+    //     break;
+    //   }
+    //   case TargetAllocTy::TARGET_ALLOC_HOST:
+    //   case TargetAllocTy::TARGET_ALLOC_SHARED: {
+    //     ptr = std::malloc(Size);
+    //       if (!ptr) {
+    //     return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
+    //   }
+    //   }
+    // }
+    // return ptr;
   }
 
   /// Deallocate memory on the device or related to the device.
@@ -393,6 +363,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
     if (Size == 0 || TgtPtr == nullptr)
       return Plugin::success();
 
+    memcpy(TgtPtr, HstPtr, Size);
+    return Plugin::success();
 
     auto it = DeviceBufferMap.find(TgtPtr);
     if (it == DeviceBufferMap.end()) {
@@ -422,25 +394,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
     }
       
 
-
-    // int64_t dims[1] = { static_cast<int64_t>(Size) };
-    // auto args = PJRT_Client_BufferFromHostBuffer_Args{
-    //   .struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE,
-    //   .client = this->pjrtCleint,
-    //   .data = HstPtr,              
-    //   .type = PJRT_Buffer_Type_S8, 
-    //   .dims = dims,
-    //   .num_dims = 1,
-    //   .byte_strides = nullptr,           
-    //   .device = this->pjrtDevice,
-    //   // .host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
-    // };
-    // auto* err = this->pjrtApi->PJRT_Client_BufferFromHostBuffer(&args);
-    // if (err) {
-    //   std::cerr << "Fail to data submit!\n";
-    //   exit(1);
-    // }
-
     auto awaitArgs = PJRT_Event_Await_Args {
       .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
       // .event = args.done_with_host_buffer
@@ -461,40 +414,28 @@ struct TPUDeviceTy : public GenericDeviceTy {
       // printf("\nNothing to be retrieved!\n");
       return Plugin::success();
     }
-    auto it = this->DeviceBufferMap.find(const_cast<void*>(TgtPtr));
-    if (it == this->DeviceBufferMap.end()) {
-      std::cerr << "This does not exist !\n";
-      exit(1);
-    }
-    if (!it->second.isRealLast) {
-      int dummy = 0;
-      auto dummyArgs = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args {
-        .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
-        .transfer_manager = it->second.TransferManager,
-        .buffer_index = 0,
-        .data = &dummy,
-        .offset = 0,
-        .transfer_size = 0,
-        .is_last_transfer = true 
+
+    typedef PJRT_Buffer* (*GetBufFn)(void*);
+    GetBufFn get_buf = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
+
+    PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
+    if (PjrtBuf) {
+      auto args = PJRT_Buffer_CopyRawToHost_Args{
+        .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
+        .buffer = PjrtBuf,
+        .dst = HstPtr,
+        .transfer_size = Size     
+      }; 
+      auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
+      assert(!err);
+
+      auto awaitArgs = PJRT_Event_Await_Args{
+        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+        .event = args.event
       };
-      this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&dummyArgs);
+      auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
+      assert(!err2);
     }
-
-    auto args = PJRT_Buffer_CopyRawToHost_Args{
-      .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
-      .buffer = it->second.PjrtBuf,
-      .transfer_size = Size,     
-      .dst = HstPtr
-    }; 
-    auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
-    assert(!err);
-
-    auto awaitArgs = PJRT_Event_Await_Args{
-      .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-      .event = args.event
-    };
-    auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-    assert(!err2);
 
     return Plugin::success();
    }
