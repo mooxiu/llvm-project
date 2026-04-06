@@ -787,17 +787,26 @@ struct TPUPluginTy final : public GenericPluginTy {
     InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
     auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
     // Theoretically need to close handle_ when exiting, but it will automatically be destroyed when exiting the program so intentionally leave it.
-    PJRT_Client_Create_Args args = {
-      .struct_size= PJRT_Client_Create_Args_STRUCT_SIZE
-    };
-    auto* error = Api->PJRT_Client_Create(&args);
-    if (error) {
-      std::cerr << "Fail to create client!\n";
-      std::exit(EXIT_FAILURE);
-    }
     this->PjrtApi = Api;
-    this->PjrtClient = args.client;
-    // printf("\nPlugin init success!\n");
+    
+    typedef PJRT_Client* (*GetClientFn)();
+    GetClientFn get_client = (GetClientFn)dlsym(RTLD_DEFAULT, "GetExecutorPJRTClient");
+    if (get_client) {
+      this->PjrtClient = get_client();
+    } else {
+      PJRT_Plugin_Initialize_Args InitArgs = {};
+      InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
+      auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
+      PJRT_Client_Create_Args args = {
+        .struct_size= PJRT_Client_Create_Args_STRUCT_SIZE
+      };
+      auto* error = Api->PJRT_Client_Create(&args);
+      if (error) {
+        std::cerr << "Fail to create client!\n";
+        std::exit(EXIT_FAILURE);
+      }
+      this->PjrtClient = args.client;
+    }
     return 1;
   }
 
