@@ -134,9 +134,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
     bool isRealLast; 
   };
 
-  std::unordered_map<void*, PjrtBufferContext> DeviceBufferMap;
-
-
   TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
               PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
@@ -291,29 +288,15 @@ struct TPUDeviceTy : public GenericDeviceTy {
     if(!TgtPtr) {
       return Plugin::success();
     }
-    auto it = this->DeviceBufferMap.find(TgtPtr);
-    if (it == this->DeviceBufferMap.end()) {
-      return Plugin::success();
-    }
 
-    PjrtBufferContext ctx = it->second;
-    if (ctx.TransferManager) {
-      auto args = PJRT_AsyncHostToDeviceTransferManager_Destroy_Args {
-        .struct_size = PJRT_AsyncHostToDeviceTransferManager_Destroy_Args_STRUCT_SIZE,
-        .transfer_manager = ctx.TransferManager
-      };
-      auto* err1 = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_Destroy(&args);
-      assert(!err1);
+    typedef void (*DestroyBufFn)(void*, const PJRT_Api*);
+    DestroyBufFn destroy_buf = (DestroyBufFn)dlsym(RTLD_DEFAULT, "DestroyPjrtBuffer");
+    if (destroy_buf) {
+        destroy_buf(TgtPtr, this->pjrtApi);
+    } else {
+        std::cerr << "Warning: DestroyPjrtBuffer not found in executor.\n";
     }
-    if (ctx.PjrtBuf) {
-      auto bufferArgs = PJRT_Buffer_Destroy_Args{
-        .struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE,
-        .buffer = ctx.PjrtBuf,
-      };
-      auto* err2 = this->pjrtApi->PJRT_Buffer_Destroy(&bufferArgs);
-      assert(!err2);
-    }
-    DeviceBufferMap.erase(TgtPtr);
+    std::free(TgtPtr); 
     return Plugin::success();
   }
 
@@ -362,49 +345,49 @@ struct TPUDeviceTy : public GenericDeviceTy {
                        AsyncInfoWrapperTy &AsyncInfoWrapper) override {
     if (Size == 0 || TgtPtr == nullptr)
       return Plugin::success();
-
+    // Creating buffer will happen on jit-code-executor side.
     memcpy(TgtPtr, HstPtr, Size);
     return Plugin::success();
 
-    auto it = DeviceBufferMap.find(TgtPtr);
-    if (it == DeviceBufferMap.end()) {
-      std::cerr << "Allocated memory pointer not found!\n";
-      exit(1);
-    }
-    PJRT_AsyncHostToDeviceTransferManager* tm = it->second.TransferManager;
-
-    PJRT_AsyncHostToDeviceTransferManager_TransferData_Args transfer_args = {
-      .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
-      .transfer_manager = tm,
-      .buffer_index = 0,
-      .data = HstPtr,
-      .offset = 0,
-      .transfer_size = Size,
-      .is_last_transfer = true,
-    };
-   
-    
-    auto* err = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&transfer_args);
-    assert(!err);
-
-    PJRT_Event* done_event = transfer_args.done_with_h2d_transfer;
-    if (done_event) {
-      PJRT_Event_Await_Args await_args = {PJRT_Event_Await_Args_STRUCT_SIZE, nullptr, done_event};
-      this->pjrtApi->PJRT_Event_Await(&await_args);
-    }
-      
-
-    auto awaitArgs = PJRT_Event_Await_Args {
-      .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-      // .event = args.done_with_host_buffer
-      .event = transfer_args.done_with_h2d_transfer
-    };
-    auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-    assert(!err2);
-
-    it->second.isRealLast = true;
-
-    return Plugin::success();
+    // auto it = DeviceBufferMap.find(TgtPtr);
+    // if (it == DeviceBufferMap.end()) {
+    //   std::cerr << "Allocated memory pointer not found!\n";
+    //   exit(1);
+    // }
+    // PJRT_AsyncHostToDeviceTransferManager* tm = it->second.TransferManager;
+    //
+    // PJRT_AsyncHostToDeviceTransferManager_TransferData_Args transfer_args = {
+    //   .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
+    //   .transfer_manager = tm,
+    //   .buffer_index = 0,
+    //   .data = HstPtr,
+    //   .offset = 0,
+    //   .transfer_size = Size,
+    //   .is_last_transfer = true,
+    // };
+    //
+    //
+    // auto* err = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&transfer_args);
+    // assert(!err);
+    //
+    // PJRT_Event* done_event = transfer_args.done_with_h2d_transfer;
+    // if (done_event) {
+    //   PJRT_Event_Await_Args await_args = {PJRT_Event_Await_Args_STRUCT_SIZE, nullptr, done_event};
+    //   this->pjrtApi->PJRT_Event_Await(&await_args);
+    // }
+    //
+    //
+    // auto awaitArgs = PJRT_Event_Await_Args {
+    //   .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+    //   // .event = args.done_with_host_buffer
+    //   .event = transfer_args.done_with_h2d_transfer
+    // };
+    // auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
+    // assert(!err2);
+    //
+    // it->second.isRealLast = true;
+    //
+    // return Plugin::success();
   }
 
   /// Retrieve data from the device (device to host transfer).
@@ -420,7 +403,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
     PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
     if (PjrtBuf) {
-
+      // Can not use `PJRT_Buffer_CopyRawToHost`, the result would be weird.
       auto args = PJRT_Buffer_ToHostBuffer_Args{
         .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
         .src = PjrtBuf,
@@ -429,15 +412,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
       };
       auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
       assert(!err);
-
-      // auto args = PJRT_Buffer_CopyRawToHost_Args{
-      //   .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
-      //   .buffer = PjrtBuf,
-      //   .dst = HstPtr,
-      //   .transfer_size = Size     
-      // }; 
-      // auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
-      // assert(!err);
 
       auto awaitArgs = PJRT_Event_Await_Args{
         .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
