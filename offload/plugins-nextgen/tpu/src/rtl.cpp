@@ -807,7 +807,7 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    auto device = findDevice(this->PjrtApi, this->PjrtClient, "cuda");
+    auto device = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
     return new TPUDeviceTy(
       Plugin, DeviceId, NumDevices, 
       this->PjrtApi, this->PjrtClient, device);
