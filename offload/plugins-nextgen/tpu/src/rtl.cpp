@@ -270,6 +270,12 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
         DeviceBufferMap[ptr] = {buffer, tm, false};
 
+        typedef void (*RegBufFn)(void*, PJRT_Buffer*);
+        RegBufFn reg_buf = (RegBufFn)dlsym(RTLD_DEFAULT, "RegisterPjrtBuffer");
+        if (reg_buf) {
+          reg_buf(AllocPtr, buffer); // Sharing with libjit-code-executor 
+        } 
+
         // int64_t dims[1] = { static_cast<int64_t>(Size) };
         // auto args = PJRT_Client_CreateUninitializedBuffer_Args{
         //   .struct_size = PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE,
