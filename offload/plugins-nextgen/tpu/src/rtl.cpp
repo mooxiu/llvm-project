@@ -424,7 +424,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
       auto args = PJRT_Buffer_ToHostBuffer_Args{
         .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
         .src = PjrtBuf,
-        .dst = HstPtr
+        .dst = HstPtr,
+        .dst_size = size_t(Size)
       };
       auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
       assert(!err);
