@@ -420,14 +420,23 @@ struct TPUDeviceTy : public GenericDeviceTy {
 
     PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
     if (PjrtBuf) {
-      auto args = PJRT_Buffer_CopyRawToHost_Args{
-        .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
-        .buffer = PjrtBuf,
-        .dst = HstPtr,
-        .transfer_size = Size     
-      }; 
-      auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
+
+      auto args = PJRT_Buffer_ToHostBuffer_Args{
+        .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
+        .src = PjrtBuf,
+        .dst = HstPtr
+      };
+      auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
       assert(!err);
+
+      // auto args = PJRT_Buffer_CopyRawToHost_Args{
+      //   .struct_size = PJRT_Buffer_CopyRawToHost_Args_STRUCT_SIZE,
+      //   .buffer = PjrtBuf,
+      //   .dst = HstPtr,
+      //   .transfer_size = Size     
+      // }; 
+      // auto* err = this->pjrtApi->PJRT_Buffer_CopyRawToHost(&args);
+      // assert(!err);
 
       auto awaitArgs = PJRT_Event_Await_Args{
         .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
