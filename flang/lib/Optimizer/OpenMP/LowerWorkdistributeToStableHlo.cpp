@@ -75,13 +75,13 @@ public:
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
     for (auto targetOp : targetOps) {
-      if (targetOp
-              ->walk(
-                  [](omp::WorkdistributeOp) { return WalkResult::interrupt(); })
-              .wasInterrupted() == false) {
-        LDBG() << "Ignoring non-workdistribute target op:\n" << *targetOp;
-        continue;
-      }
+      // if (targetOp
+      //         ->walk(
+      //             [](omp::WorkdistributeOp) { return WalkResult::interrupt(); })
+      //         .wasInterrupted() == false) {
+      //   LDBG() << "Ignoring non-workdistribute target op:\n" << *targetOp;
+      //   continue;
+      // }
 
       auto &region = targetOp.getRegion();
       auto &block = region.front();

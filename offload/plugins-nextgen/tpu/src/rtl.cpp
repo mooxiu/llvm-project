@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -43,6 +44,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Program.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/FunctionComparator.h"
 
 using namespace error;
 
@@ -703,8 +705,8 @@ struct TPUPluginTy final : public GenericPluginTy {
       Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     }
     if (!Handle) {
-      std::cerr << "error loading plugin: " << dlerror() << std::endl;
-      std::exit(EXIT_FAILURE);
+      printf("TPU plugin not found, fall back to CPU!\n");
+      return 0;
     }
     // follow the example of `man dlopen`
     auto GetApiFn = (PJRT_Api * (*)()) dlsym(Handle, "GetPjrtApi");
