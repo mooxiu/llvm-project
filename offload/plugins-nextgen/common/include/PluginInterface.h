@@ -36,6 +36,7 @@
 #include "OffloadError.h"
 #include "RPC.h"
 #include "omptarget.h"
+#include "llvm/Support/Debug.h"
 
 #ifdef OMPT_SUPPORT
 #include "omp-tools.h"
@@ -385,7 +386,7 @@ struct GenericKernelTy {
   delegatedLaunchImpl(GenericDeviceTy &GenericDevice,
                       std::function<int64_t(void *)> &DelegatedLaunch,
                       AsyncInfoWrapperTy &AsyncInfoWrapper) const {
-    DP("UNIMPLEMENTED DELEGATED LAUNCH\n");
+    llvm::dbgs() << "UNIMPLEMENTED DELEGATED LAUNCH\n";
     llvm_unreachable("unsupported");
   }
 

@@ -141,13 +141,14 @@ public:
           b, targetOp.getLoc(), targetOp.getAllocateVars(),
           targetOp.getAllocatorVars(), targetOp.getBareAttr(),
           targetOp.getDependKindsAttr(), targetOp.getDependVars(),
+          targetOp.getDependIteratedKindsAttr(), targetOp.getDependIterated(),
           targetOp.getDevice(), targetOp.getHasDeviceAddrVars(),
           targetOp.getHostEvalVars(), targetOp.getIfExpr(),
           targetOp.getInReductionVars(), targetOp.getInReductionByrefAttr(),
           targetOp.getInReductionSymsAttr(), targetOp.getIsDevicePtrVars(),
           targetOp.getMapVars(), targetOp.getNowaitAttr(),
           targetOp.getPrivateVars(), targetOp.getPrivateSymsAttr(),
-          targetOp.getPrivateNeedsBarrierAttr(), targetOp.getThreadLimit(),
+          targetOp.getPrivateNeedsBarrierAttr(), targetOp.getThreadLimitVars(),
           targetOp.getPrivateMapsAttr(),
           /*jit_code=*/StringAttr::get(&context, str.c_str()));
       targetJitOp.getRegion().takeBody(targetOp.getRegion());

@@ -32,6 +32,8 @@
 #include "llvm/ADT/bit.h"
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <cassert>
 #include <cstddef>
@@ -2273,23 +2275,29 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
               JitKernelArgsTy &KernelArgs, AsyncInfoTy &AsyncInfo) {
 
   if (!JitCodeExecutor) {
-    DP("%s required and we could not load it.\n", JitCodeExecutorName);
+    llvm::dbgs() << JitCodeExecutorName << " required and we could not load it.\n";
     abort();
   }
 
   int32_t DeviceId = Device.DeviceID;
 
   if (!Device.DummyKernel) {
-    DP("Dummy kernel for device %d %p does not exist: %p\n", DeviceId, &Device,
-       Device.DummyKernel);
+    llvm::dbgs() << "dummy kernel for device " 
+                << DeviceId 
+                << " " 
+                << &Device 
+                << "does not exist: "
+                << Device.DummyKernel
+                << "\n";
     abort();
   }
 
   TableMap *TM = getTableMap(HostPtr);
   // No map for this host pointer found!
   if (!TM) {
-    REPORT("Host ptr " DPxMOD " does not have a matching target pointer.\n",
-           DPxPTR(HostPtr));
+    REPORT() << "Host ptr " 
+              << HostPtr
+              << " does not have a matching target pointer.\n";
     return OFFLOAD_FAIL;
   }
 
@@ -2327,7 +2335,7 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
                             KernelArgs.ArgNames, KernelArgs.ArgMappers, TgtArgs,
                             TgtOffsets, PrivateArgumentManager, AsyncInfo);
     if (Ret != OFFLOAD_SUCCESS) {
-      REPORT("Failed to process data before launching the kernel.\n");
+      REPORT() << "Failed to process data before launching the kernel.\n";
       return OFFLOAD_FAIL;
     }
 
@@ -2339,10 +2347,8 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
   }
 
   void *TgtEntryPtr = TargetTable->EntriesBegin[TM->Index].Address;
-  DP("Launching target jit execution %s with pointer " DPxMOD " (index=%d).\n",
-     TargetTable->EntriesBegin[TM->Index].SymbolName, DPxPTR(TgtEntryPtr),
-     TM->Index);
-
+  llvm::dbgs() << 
+    llvm::formatv("Launching target jit execution {0} with pointer {1} (index={3}).\n", TargetTable->EntriesBegin[TM->Index].SymbolName, DPxPTR(TgtEntryPtr), TM->Index);
   {
     assert(KernelArgs.NumArgs == TgtArgs.size() && "Argument count mismatch!");
     TIMESCOPE_WITH_DETAILS_AND_IDENT(
@@ -2359,7 +2365,7 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
   }
 
   if (Ret != OFFLOAD_SUCCESS) {
-    REPORT("Executing target region abort target.\n");
+    REPORT() << "Executing target region abort target.\n";
     return OFFLOAD_FAIL;
   }
 
@@ -2372,7 +2378,7 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
                            KernelArgs.ArgNames, KernelArgs.ArgMappers,
                            PrivateArgumentManager, AsyncInfo);
     if (Ret != OFFLOAD_SUCCESS) {
-      REPORT("Failed to process data after launching the kernel.\n");
+      REPORT() << "Failed to process data after launching the kernel.\n";
       return OFFLOAD_FAIL;
     }
   }

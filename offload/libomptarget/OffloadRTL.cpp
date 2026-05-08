@@ -15,6 +15,7 @@
 
 #include "Shared/Debug.h"
 #include "Shared/Profile.h"
+#include "llvm/Support/Debug.h"
 #include <dlfcn.h>
 
 #ifdef OMPT_SUPPORT
@@ -65,8 +66,8 @@ void initRuntime() {
       dlsym(RTLD_DEFAULT, JitCodeExecutorName));
   const char *Err = dlerror();
   if (Err) {
-    DP("Could not load %s", JitCodeExecutorName);
-    DP("dlsym error: %s\n", Err);
+    llvm::dbgs() << "Could not load s" << JitCodeExecutorName;
+    llvm::dbgs() << "dlsym error: " << Err << "\n";
     JitCodeExecutor = nullptr;
   }
 }

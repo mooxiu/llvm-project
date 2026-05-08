@@ -80,8 +80,8 @@ struct TPUKernelTy : public GenericKernelTy {
                       AsyncInfoWrapperTy &AsyncInfoWrapper) const override;
 
   Error launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
-                   uint32_t NumBlocks[3], KernelArgsTy &KernelArgs,
-                   KernelLaunchParamsTy LaunchParams,
+                   uint32_t NumBlocks[3], uint32_t DynBlockMemSize,
+                   KernelArgsTy &KernelArgs, KernelLaunchParamsTy LaunchParams,
                    AsyncInfoWrapperTy &AsyncInfoWrapper) const override;
 
   /// Return maximum block size for maximum occupancy
@@ -170,7 +170,7 @@ struct TPUDeviceTy : public GenericDeviceTy {
   }
 
   Expected<std::unique_ptr<MemoryBuffer>>
-  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const override{
+  doJITPostProcessing(std::unique_ptr<MemoryBuffer> MB) const override {
     llvm_unreachable("TPUDeviceTy doJITPostProcessing");
   }
 
@@ -309,6 +309,10 @@ struct TPUDeviceTy : public GenericDeviceTy {
     return Plugin::success();
   }
 
+  bool supportVAManagement() const override {
+    return true;
+  }
+
   /// Allocates \p RSize bytes (rounded up to page size) and hints the cuda
   /// driver to map it to \p VAddr. The obtained address is stored in \p Addr.
   /// At return \p RSize contains the actual size
@@ -324,7 +328,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
   }
 
   /// Query for the completion of the pending operations on the async info.
-  Error queryAsyncImpl(__tgt_async_info &AsyncInfo) override {
+  Error queryAsyncImpl(__tgt_async_info &AsyncInfo, bool ReleaseQueue,
+                       bool *IsQueueWorkCompleted) override {
     llvm_unreachable("TPUDeviceTy queryAsyncImpl");
   }
 
@@ -566,6 +571,11 @@ struct TPUDeviceTy : public GenericDeviceTy {
     return Plugin::success();
   }
 
+  Expected<float> getEventElapsedTimeImpl(void *StartEventPtr,
+                                          void *EndEventPtr) override {
+    return Plugin::success();
+  };
+
   Expected<bool> hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) override {
     return false; 
   }
@@ -609,11 +619,10 @@ Error TPUKernelTy::delegatedLaunchImpl(
   return Plugin::success();
 }
 
-Error TPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
-                               uint32_t NumThreads[3], uint32_t NumBlocks[3],
-                               KernelArgsTy &KernelArgs,
-                               KernelLaunchParamsTy LaunchParams,
-                               AsyncInfoWrapperTy &AsyncInfoWrapper) const {
+Error TPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
+                   uint32_t NumBlocks[3], uint32_t DynBlockMemSize,
+                   KernelArgsTy &KernelArgs, KernelLaunchParamsTy LaunchParams,
+                   AsyncInfoWrapperTy &AsyncInfoWrapper) const {
   return Plugin::success();
 }
 
@@ -749,10 +758,8 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    auto device = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
-    return new TPUDeviceTy(
-      Plugin, DeviceId, NumDevices, 
-      this->PjrtApi, this->PjrtClient, device);
+    auto* TPUDevice = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
+    return new TPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi, this->PjrtClient, TPUDevice);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {

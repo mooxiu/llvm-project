@@ -25,6 +25,7 @@
 #include "Utils/ExponentialBackoff.h"
 
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+#include "llvm/Support/Debug.h"
 
 #include <cassert>
 #include <cstdint>
@@ -373,12 +374,15 @@ static inline int targetJitKernel(ident_t *Loc, int64_t DeviceId, void *HostPtr,
   assert(PM && "Runtime not initialized");
   static_assert(std::is_convertible_v<TargetAsyncInfoTy &, AsyncInfoTy &>,
                 "Target AsyncInfoTy must be convertible to AsyncInfoTy.");
-  DP("Entering target jit region for device %" PRId64
-     " with entry point " DPxMOD "\n",
-     DeviceId, DPxPTR(HostPtr));
+  llvm::dbgs() << "Entering target jit region for device " 
+               << DeviceId 
+               << " with entry point " 
+               << HostPtr << "\n";
 
   if (checkDevice(DeviceId, Loc)) {
-    DP("Not offloading to device %" PRId64 "\n", DeviceId);
+    llvm::dbgs() << "Not offloading to device "
+                 << DeviceId
+                 << "\n";
     return OMP_TGT_FAIL;
   }
 

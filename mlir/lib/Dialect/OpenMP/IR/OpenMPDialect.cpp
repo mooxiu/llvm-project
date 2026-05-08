@@ -2416,13 +2416,14 @@ void TargetJitOp::build(OpBuilder &builder, OperationState &state,
   TargetJitOp::build(
       builder, state, /*allocate_vars=*/{}, /*allocator_vars=*/{}, clauses.bare,
       makeArrayAttr(ctx, clauses.dependKinds), clauses.dependVars,
+      makeArrayAttr(ctx, clauses.dependIteratedKinds), clauses.dependIterated,
       clauses.device, clauses.hasDeviceAddrVars, clauses.hostEvalVars,
       clauses.ifExpr,
       /*in_reduction_vars=*/{}, /*in_reduction_byref=*/nullptr,
       /*in_reduction_syms=*/nullptr, clauses.isDevicePtrVars, clauses.mapVars,
       clauses.nowait, clauses.privateVars,
       makeArrayAttr(ctx, clauses.privateSyms), clauses.privateNeedsBarrier,
-      clauses.threadLimit,
+      clauses.threadLimitVars,
       /*private_maps=*/nullptr, /*jit_code=*/nullptr);
 }
 
@@ -2443,6 +2444,7 @@ void TargetOp::build(OpBuilder &builder, OperationState &state,
       makeArrayAttr(ctx, clauses.privateSyms), clauses.privateNeedsBarrier,
       clauses.threadLimitVars,
       /*private_maps=*/nullptr, /*jit_code=*/nullptr);
+}
 
 LogicalResult TargetOp::verify() {
   if (failed(verifyDependVarList(*this, getDependKinds(), getDependVars(),

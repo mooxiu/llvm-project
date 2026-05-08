@@ -541,10 +541,10 @@ static int loadImagesOntoDevice(DeviceTy &Device) {
 
   if (Device.RTL->get_dummy_function(DeviceId, &Device.DummyKernel) !=
       OFFLOAD_SUCCESS) {
-    REPORT("Failed to get dummy function\n");
+    REPORT() << "Failed to get dummy function\n";
   } else {
-    DP("Generated dummy function for device %d %p: %p\n", DeviceId, &Device,
-       Device.DummyKernel);
+   llvm::dbgs() << llvm::formatv("Generated dummy function for device {0} {1}: {2}\n",  
+                                DeviceId, &Device, Device.DummyKernel);
   }
 
   if (Rc != OFFLOAD_SUCCESS)

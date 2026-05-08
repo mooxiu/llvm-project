@@ -1872,8 +1872,9 @@ int32_t GenericPluginTy::get_dummy_function(int32_t DeviceId,
 
   auto KernelOrErr = Device.constructKernel(Name);
   if (Error Err = KernelOrErr.takeError()) {
-    REPORT("Failure to construct dummy function: %s\n",
-           toString(std::move(Err)).data());
+    REPORT() << "Failure to construct dummy function: " 
+              << toString(std::move(Err)).data()
+              << "\n";
     return OFFLOAD_FAIL;
   }
 
@@ -2061,8 +2062,11 @@ int32_t GenericPluginTy::delegated_launch_kernel(
   auto Err = getDevice(DeviceId).delegatedLaunchKernel(
       TgtEntryPtr, DelegatedLaunch, AsyncInfoPtr);
   if (Err) {
-    REPORT("Failure to run target jit region in device %d: %s\n", DeviceId,
-           toString(std::move(Err)).data());
+    REPORT() << "Failure to run target jit region in device "
+              << DeviceId
+              << ": "
+              << toString(std::move(Err)).data()
+              << "\n";
     return OFFLOAD_FAIL;
   }
 

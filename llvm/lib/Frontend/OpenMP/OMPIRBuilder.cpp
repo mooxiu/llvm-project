@@ -9568,8 +9568,8 @@ OpenMPIRBuilder::InsertPointOrErrorTy OpenMPIRBuilder::createTarget(
     OpenMPIRBuilder::TargetGenArgAccessorsCallbackTy ArgAccessorFuncCB,
     CustomMapperCallbackTy CustomMapperCB,
     const SmallVector<DependData> &Dependencies, bool HasNowait,
-    Value *DynCGroupMem, OMPDynGroupprivateFallbackType DynCGroupMemFallback,
-    Value *JitCond, Value *JitCode) {
+    Value *JitCond, Value *JitCode,
+    Value *DynCGroupMem, OMPDynGroupprivateFallbackType DynCGroupMemFallback) {
 
   if (!updateToLocation(Loc))
     return InsertPointTy();

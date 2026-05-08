@@ -3573,10 +3573,10 @@ public:
       TargetGenArgAccessorsCallbackTy ArgAccessorFuncCB,
       CustomMapperCallbackTy CustomMapperCB,
       const SmallVector<DependData> &Dependencies, bool HasNowait = false,
+      Value *JitCond = nullptr, Value *JitCode = nullptr,
       Value *DynCGroupMem = nullptr,
       omp::OMPDynGroupprivateFallbackType DynCGroupMemFallback =
-          omp::OMPDynGroupprivateFallbackType::Abort ,
-      Value *JitCond = nullptr, Value *JitCode = nullptr);
+          omp::OMPDynGroupprivateFallbackType::Abort);
 
   /// Returns __kmpc_for_static_init_* runtime function for the specified
   /// size \a IVSize and sign \a IVSigned. Will create a distribute call
