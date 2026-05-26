@@ -34,6 +34,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -7527,7 +7528,7 @@ LogicalResult OpenMPDialectLLVMIRTranslationInterface::convertOperation(
   llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
 
   if (ompBuilder->Config.isTargetDevice() &&
-      !isa<omp::TargetOp, omp::MapInfoOp, omp::TerminatorOp, omp::YieldOp>(
+      !isa<omp::TargetOp, omp::TargetJitOp, omp::MapInfoOp, omp::TerminatorOp, omp::YieldOp>(
           op) &&
       isHostDeviceOp(op))
     return op->emitOpError() << "unsupported host op found in device";
@@ -7687,7 +7688,58 @@ LogicalResult OpenMPDialectLLVMIRTranslationInterface::convertOperation(
           .Case([&](omp::TargetOp) {
             return convertOmpTarget<omp::TargetOp>(*op, builder, moduleTranslation);
           })
-          .Case([&](omp::TargetOp) {
+          .Case([&](omp::TargetJitOp) {
+            auto isTargetDeviceOp = [](Operation *op) {
+              // Assumes no reverse offloading
+              if (op->getParentOfType<omp::TargetOp>())
+                return true;
+
+              // Certain operations return results, and whether utilised in host or
+              // target there is a chance an LLVM Dialect operation depends on it
+              // by taking it in as an operand, so we must always lower these in
+              // some manner or result in an ICE (whether they end up in a no-op
+              // or otherwise).
+              if (mlir::isa<omp::ThreadprivateOp>(op))
+                return true;
+
+              if (mlir::isa<omp::TargetAllocMemOp>(op) ||
+                  mlir::isa<omp::TargetFreeMemOp>(op))
+                return true;
+
+              if (auto parentFn = op->getParentOfType<LLVM::LLVMFuncOp>())
+                if (auto declareTargetIface =
+                        llvm::dyn_cast<mlir::omp::DeclareTargetInterface>(
+                            parentFn.getOperation()))
+                  if (declareTargetIface.isDeclareTarget() &&
+                      declareTargetIface.getDeclareTargetDeviceType() !=
+                          mlir::omp::DeclareTargetDeviceType::host)
+                    return true;
+
+              return false;
+            };
+
+            llvm::OpenMPIRBuilder *ompBuilder = moduleTranslation.getOpenMPBuilder();
+
+            if (ompBuilder->Config.isTargetDevice()) {
+              if (isTargetDeviceOp(op)) {
+                return convertOmpTarget<omp::TargetJitOp>(*op, builder, moduleTranslation);
+              }
+              for (Region &region : op->getRegions()) {
+                // Regions are fake in the sense that they are not a truthful
+                // translation of the OpenMP construct being converted (e.g. no
+                // OpenMP runtime calls will be generated). We just need this to
+                // prepare the kernel invocation args.
+                SmallVector<llvm::PHINode *> phis;
+                auto result = convertOmpOpRegions(
+                    region, op->getName().getStringRef().str() + ".fake.region",
+                    builder, moduleTranslation, &phis);
+                if (failed(handleError(result, *op)))
+                  return failure();
+
+                builder.SetInsertPoint(result.get(), result.get()->end());
+                return success();
+              }
+            }
             return convertOmpTarget<omp::TargetJitOp>(*op, builder, moduleTranslation);
           })
           .Case([&](omp::DistributeOp) {
