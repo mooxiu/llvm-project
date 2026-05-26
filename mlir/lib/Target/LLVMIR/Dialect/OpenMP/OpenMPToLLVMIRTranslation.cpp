@@ -4773,6 +4773,7 @@ static TargetDirectiveEnumTy getTargetDirectiveEnumTyFromOp(Operation *op) {
         return TargetDirectiveEnumTy::TargetUpdate;
       })
       .Case([&](omp::TargetOp) { return TargetDirectiveEnumTy::Target; })
+      .Case([&](omp::TargetJitOp) { return TargetDirectiveEnumTy::Target; })
       .Default([&](Operation *op) { return TargetDirectiveEnumTy::None; });
 }
 
