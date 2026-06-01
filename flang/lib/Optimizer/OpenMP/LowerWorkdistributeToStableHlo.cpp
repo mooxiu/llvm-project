@@ -29,6 +29,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include <cassert>
 #include <clang/Parse/Parser.h>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -256,6 +257,7 @@ static void removePrivateVarsFromMapEntry(
     if (!found.has_value()) continue;
 
     shadowGlobalVarWithLocalVar(found.value(), targetDeclaredOperand, opBuilder);
+    assert(declareOp.getResults().use_empty());
     declareOp.erase();
     arg.dropAllUses();
     entryBlock.eraseArgument(argIdx);
@@ -299,6 +301,8 @@ static void expandLoopNestOp(
     lastLoopOp = loopOp;
     newInductionVars.push_back(loopOp.getInductionVar()); 
   }
+
+  assert(lastLoopOp);
 
   auto* targetBlock = lastLoopOp.getBody();
   auto* sourceBlock = &lNOp.getRegion().front();
@@ -352,10 +356,9 @@ static void flattenTargetOp(
     mlir::Block *innerBlock = &wrapper->getRegion(0).front();
     auto &innerOps = innerBlock->getOperations();
     mlir::Block::iterator insertPt(wrapper);
-    auto* terminator = innerBlock->getTerminator();
     auto insertEnd = innerOps.end();
-    if (llvm::isa_and_nonnull<omp::TerminatorOp>(terminator)) {
-      insertEnd = mlir::Block::iterator(terminator);
+    if (!innerOps.empty() && innerOps.back().hasTrait<OpTrait::IsTerminator>()) {
+      insertEnd = mlir::Block::iterator(&innerOps.back());
     }
     parentBlock->getOperations().splice(
       insertPt,

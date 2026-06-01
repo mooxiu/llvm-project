@@ -16,6 +16,8 @@
 #include "OpenMP/OMPT/Callback.h"
 #include "OpenMP/omp.h"
 #include "PluginManager.h"
+#include "Shared/Debug.h"
+#include "Shared/SourceInfo.h"
 #include "omptarget.h"
 #include "private.h"
 
@@ -32,7 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
-#include <vector>
+#include <string>
 
 #ifdef OMPT_SUPPORT
 using namespace llvm::omp::target::ompt;
@@ -398,14 +400,15 @@ static inline int targetJitKernel(ident_t *Loc, int64_t DeviceId, void *HostPtr,
                          KernelArgs->ArgSizes, KernelArgs->ArgTypes,
                          KernelArgs->ArgNames, "Entering OpenMP kernel");
 #ifdef OMPTARGET_DEBUG
+
   for (uint32_t I = 0; I < KernelArgs->NumArgs; ++I) {
-    DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-       ", Type=0x%" PRIx64 ", Name=%s\n",
-       I, DPxPTR(KernelArgs->ArgBasePtrs[I]), DPxPTR(KernelArgs->ArgPtrs[I]),
-       KernelArgs->ArgSizes[I], KernelArgs->ArgTypes[I],
-       (KernelArgs->ArgNames)
-           ? getNameFromMapping(KernelArgs->ArgNames[I]).c_str()
-           : "unknown");
+    llvm::dbgs() << "Entry " << llvm::format("%2d", I) 
+               << ": Base=" << KernelArgs->ArgBasePtrs[I]
+               << ", Begin=" << KernelArgs->ArgPtrs[I]
+               << ", Size=" << KernelArgs->ArgSizes[I]
+               << ", Type=" << llvm::format_hex(KernelArgs->ArgTypes[I], 10)
+               << ", Name=" << ((KernelArgs->ArgNames) ? getNameFromMapping(KernelArgs->ArgNames[I]) : "unknown")
+               << "\n";
   }
 #endif
 
