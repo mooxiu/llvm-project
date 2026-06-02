@@ -29,7 +29,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include <cassert>
 #include <clang/Parse/Parser.h>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -82,7 +81,24 @@ static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
     + targetOp.numHostEvalBlockArgs();
 }
 
+static unsigned getReductionVarsOffset(Operation* wrapper) {
+  auto offset = 0;
+  llvm::TypeSwitch<Operation*>(wrapper)
+    .Case([&](omp::WsloopOp wsLoopOp){
+      // [private_vars, reduction_vars]
+      offset = wsLoopOp.numPrivateBlockArgs();
+      return;
+    })
+    .Case([&](omp::TeamsOp teamsOp){
+      // [private_vars, reduction_vars]
+      offset = teamsOp.numPrivateBlockArgs();
+      return;
+    })
+    .Default([&](Operation*){return;});
+  return offset;
+}
 
+/// Get wrappers ordering from outmost to innermost
 static SmallVector<Operation*> getOmpWrappers(omp::TargetOp targetOp) {
   llvm::SmallVector<Operation*> wrappers;
   // The default order is from innermost to outermost
@@ -333,16 +349,80 @@ static void expandLoopNestOp(
 }
 
 
+template<typename T>
+static void replaceLocalReductionVars(T wrapper) {
+  auto reductionVarsOffset = getReductionVarsOffset(wrapper);
+  auto& entryBlock = wrapper.getRegion().front();
+
+  int reductionVarsCount = wrapper.numReductionBlockArgs();
+  assert(wrapper.getReductionVars().size() == reductionVarsCount);
+
+  for (int i = 0; i < reductionVarsCount; i++) {
+    Value reductionVarArg = entryBlock.getArgument(reductionVarsOffset + i);
+    Value reductionVar = wrapper.getReductionVars()[i];
+
+    for (auto &use: reductionVarArg.getUses()) {
+      if (auto declaredOp = llvm::dyn_cast<hlfir::DeclareOp>(use.getOwner())) {
+        assert(declaredOp.getMemref() == reductionVarArg);
+        declaredOp.getResult(0).replaceAllUsesWith(reductionVar);
+        if (declaredOp.getNumResults() > 1) {
+          assert(declaredOp.getNumResults() == 2);
+          assert(declaredOp.getResult(1).use_empty());
+        }
+        assert(declaredOp.use_empty());
+        declaredOp.erase();
+      } else {
+        use.assign(reductionVar);
+      }
+    }
+    assert(reductionVarArg.use_empty());
+  }
+
+  for (int i = reductionVarsCount - 1; i >= 0; i--) {
+    entryBlock.eraseArgument(reductionVarsOffset + i);
+    wrapper.getReductionVarsMutable().erase(i);
+  }
+
+  assert(wrapper.getReductionVars().empty());
+
+  if (wrapper->hasAttr(wrapper.getReductionSymsAttrName())) {
+    wrapper->removeAttr(wrapper.getReductionSymsAttrName());
+  }
+}
+
+template<typename T, typename Callable>
+static bool applyToConcreteType(Operation* wrapper, Callable f) {
+  if (auto concreteOp = llvm::dyn_cast<T>(wrapper)) {
+    f(concreteOp);
+    return true;
+  }
+  return false;
+}
+
 static void flattenTargetOp(
   llvm::SmallVector<Operation*>& wrappers, 
   omp::TargetOp targetOp, 
   OpBuilder& builder
 ) {
+  // erase reduction vars
+  for (int i = wrappers.size() - 1; i >= 0; i--) {
+    auto* wrapper = wrappers[i]; 
+    if (
+      applyToConcreteType<omp::WsloopOp>(wrapper, replaceLocalReductionVars<omp::WsloopOp>)
+      || applyToConcreteType<omp::TeamsOp>(wrapper, replaceLocalReductionVars<omp::TeamsOp>)
+    ) {
+      continue;
+    }
+  }
+
+  llvm::errs() << "\n dump target after replace reduction:\n";
+  targetOp->dumpPretty();
+
+  // expand loopNests
   llvm::SmallVector<omp::LoopNestOp> loopNests;
   targetOp.walk([&](omp::LoopNestOp lNOp) {
     loopNests.push_back(lNOp);
   });
-
   for (auto& lNOp: loopNests) {
     expandLoopNestOp(lNOp, builder);
   }
@@ -514,10 +594,20 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
+        llvm::errs() << "\n dump moduleOp: \n";
+        moduleOp->dumpPretty();
+        llvm::errs() << "\n end dump \n";
+
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
+        llvm::errs() << "\nanchor 1\n";
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
+        llvm::errs() << "\nanchor 2\n";
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
+
+        llvm::errs() << "\n dump moduleOp after: \n";
+        moduleOp->dumpPretty();
+        llvm::errs() << "\n end dump after\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
