@@ -415,9 +415,6 @@ static void flattenTargetOp(
     }
   }
 
-  llvm::errs() << "\n dump target after replace reduction:\n";
-  targetOp->dumpPretty();
-
   // expand loopNests
   llvm::SmallVector<omp::LoopNestOp> loopNests;
   targetOp.walk([&](omp::LoopNestOp lNOp) {
@@ -594,20 +591,10 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
-        llvm::errs() << "\n dump moduleOp: \n";
-        moduleOp->dumpPretty();
-        llvm::errs() << "\n end dump \n";
-
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
-        llvm::errs() << "\nanchor 1\n";
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
-        llvm::errs() << "\nanchor 2\n";
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
-
-        llvm::errs() << "\n dump moduleOp after: \n";
-        moduleOp->dumpPretty();
-        llvm::errs() << "\n end dump after\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
