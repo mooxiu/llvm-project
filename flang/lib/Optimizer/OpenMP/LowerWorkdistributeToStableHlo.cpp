@@ -94,6 +94,11 @@ static unsigned getReductionVarsOffset(Operation* wrapper) {
       offset = teamsOp.numPrivateBlockArgs();
       return;
     })
+    .Case([&](omp::SimdOp simdOp){
+      // [private_vars, reduction_vars]
+      offset = simdOp.numPrivateBlockArgs();
+      return;
+    })
     .Default([&](Operation*){return;});
   return offset;
 }
@@ -145,7 +150,7 @@ static std::optional<PrivateOmpOp> findInPrivateVars(Value val) {
   return std::nullopt;
 }
 
-static void shadowGlobalVarWithLocalVar(PrivateOmpOp wrapper, Value globalVar, OpBuilder opBuilder) {
+static void shadowGlobalVarWithLocalVar(PrivateOmpOp wrapper, Value globalVar, OpBuilder& opBuilder) {
   std::visit([&](auto&& op){
     auto privateVars = op.getPrivateVars();
     auto it = llvm::find(privateVars, globalVar);
@@ -357,12 +362,14 @@ static void replaceLocalReductionVars(T wrapper) {
   int reductionVarsCount = wrapper.numReductionBlockArgs();
   assert(wrapper.getReductionVars().size() == reductionVarsCount);
 
+
+  llvm::DenseSet<Operation*> toErase;
   for (int i = 0; i < reductionVarsCount; i++) {
     Value reductionVarArg = entryBlock.getArgument(reductionVarsOffset + i);
     Value reductionVar = wrapper.getReductionVars()[i];
 
-    for (auto &use: reductionVarArg.getUses()) {
-      if (auto declaredOp = llvm::dyn_cast<hlfir::DeclareOp>(use.getOwner())) {
+    for (auto* user: reductionVarArg.getUsers()) {
+      if (auto declaredOp = llvm::dyn_cast<hlfir::DeclareOp>(user)) {
         assert(declaredOp.getMemref() == reductionVarArg);
         declaredOp.getResult(0).replaceAllUsesWith(reductionVar);
         if (declaredOp.getNumResults() > 1) {
@@ -370,13 +377,14 @@ static void replaceLocalReductionVars(T wrapper) {
           assert(declaredOp.getResult(1).use_empty());
         }
         assert(declaredOp.use_empty());
-        declaredOp.erase();
-      } else {
-        use.assign(reductionVar);
-      }
+        toErase.insert(declaredOp);
+      }    
     }
+    reductionVarArg.replaceAllUsesWith(reductionVar);
     assert(reductionVarArg.use_empty());
   }
+
+  llvm::for_each(toErase, [](Operation* op){op->erase();});
 
   for (int i = reductionVarsCount - 1; i >= 0; i--) {
     entryBlock.eraseArgument(reductionVarsOffset + i);
@@ -408,7 +416,9 @@ static void flattenTargetOp(
   for (int i = wrappers.size() - 1; i >= 0; i--) {
     auto* wrapper = wrappers[i]; 
     if (
-      applyToConcreteType<omp::WsloopOp>(wrapper, replaceLocalReductionVars<omp::WsloopOp>)
+      // Should in an inner -> outer ordering!
+      applyToConcreteType<omp::SimdOp>(wrapper, replaceLocalReductionVars<omp::SimdOp>)
+      || applyToConcreteType<omp::WsloopOp>(wrapper, replaceLocalReductionVars<omp::WsloopOp>)
       || applyToConcreteType<omp::TeamsOp>(wrapper, replaceLocalReductionVars<omp::TeamsOp>)
     ) {
       continue;
