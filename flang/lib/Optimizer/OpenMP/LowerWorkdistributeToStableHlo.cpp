@@ -101,7 +101,6 @@ static llvm::SmallVector<Operation*> getDeclaredOp(omp::TargetOp targetOp, const
   };
 
   while (!shouldEnd(definedOp)) {
-    llvm::errs() << "\ngo to here again...\n";
     if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
       curr = mapInfoOp.getVarPtr();
       definedOp = curr.getDefiningOp(); 
@@ -164,9 +163,6 @@ static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilde
     if (!hasDeclared) continue;
 
     assert(llvm::isa<fir::AllocaOp>(declaredOp));
-    llvm::errs() << "\n I have a temp: ";
-    declaredOp->print(llvm::errs());
-    llvm::errs() << "\n";
     IRMapping vmap;
     bool canCloneSafely = true;
 
@@ -731,27 +727,12 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
-        llvm::errs() << "\nBefore compile:>>>\n";
-        moduleOp->dumpPretty();
-        llvm::errs() << "\n<<<Before End.\n";
-
-
         llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
-
-        llvm::errs() << "\nAfter Flatten:>>>\n";
-        moduleOp->dumpPretty();
-        llvm::errs() << "\n<<<Flatten End.\n";
-
-
         handleTemporaryVariables(targetOp, opBuilder);
-
-        llvm::errs() << "\nAfter compile:>>>\n";
-        moduleOp->dumpPretty();
-        llvm::errs() << "\n<<<After End.\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
