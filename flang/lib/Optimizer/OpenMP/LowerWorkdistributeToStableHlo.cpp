@@ -29,6 +29,17 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cassert>
+#include <clang/AST/OpenMPClause.h>
 #include <clang/Parse/Parser.h>
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -51,6 +62,7 @@
 #include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <optional>
+#include <utility>
 #include <variant>
 
 namespace flangomp {
@@ -64,13 +76,6 @@ using namespace mlir;
 
 namespace {
 
-using PrivateOmpOp = std::variant<omp::TeamsOp, 
-                                  omp::ParallelOp, 
-                                  omp::DistributeOp,
-                                  omp::WsloopOp, 
-                                  omp::SimdOp>;
-
-
 static unsigned getBlockHostEvalVarsOffset(omp::TargetOp targetOp) {
   return targetOp.numHasDeviceAddrBlockArgs();
 }
@@ -80,6 +85,136 @@ static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
     + targetOp.numInReductionBlockArgs()
     + targetOp.numHostEvalBlockArgs();
 }
+
+
+static llvm::SmallVector<Operation*> getDeclaredOp(omp::TargetOp targetOp, const Value& candidate) {
+  llvm::SmallVector<Operation*> track;
+
+  auto subroutineFunc = targetOp->getParentOfType<func::FuncOp>();
+  
+  auto curr = candidate;
+  auto* definedOp = curr.getDefiningOp();
+  track.push_back(definedOp);
+  auto shouldEnd = [&](Operation* definedOp) -> bool {
+    if (!definedOp) return true; // also include the case when val is in block
+    return llvm::isa<fir::AllocaOp>(definedOp) || !subroutineFunc->isAncestor(definedOp);
+  };
+
+  while (!shouldEnd(definedOp)) {
+    llvm::errs() << "\ngo to here again...\n";
+    if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
+      curr = mapInfoOp.getVarPtr();
+      definedOp = curr.getDefiningOp(); 
+      track.push_back(definedOp);
+      continue;
+    } 
+    if (auto viewOp = llvm::dyn_cast<mlir::ViewLikeOpInterface>(definedOp)) {
+      curr = viewOp.getViewSource();
+      definedOp = curr.getDefiningOp();
+      track.push_back(definedOp);
+      continue;
+    }
+    if (auto hlfirDeclareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
+      curr = hlfirDeclareOp.getMemref();
+      definedOp = curr.getDefiningOp();
+      track.push_back(definedOp);
+      continue;
+    }
+    // unexepected situation, should 
+    llvm::errs() << "Unexpected Situation: ";
+    definedOp->print(llvm::errs());
+    llvm::errs() << "\n";
+    track.push_back(nullptr);
+    break;
+  }
+  return track;
+}
+
+// FIXME: fill this
+static bool isTargetOrPointer(Operation* definedOp) {
+  return false;
+}
+
+static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilder) {
+  auto funcOp = targetOp->getParentOfType<func::FuncOp>();
+  auto& entryBlock = targetOp.getRegion().front(); 
+  
+  auto mapVars = targetOp.getMapVars();
+  llvm::SmallVector<int> tempMapVarIndices;
+  auto mapVarOffset = getBlockMapVarsOffset(targetOp);
+
+  OpBuilder::InsertionGuard guard(opBuilder); 
+  opBuilder.setInsertionPointToStart(&entryBlock);
+
+  for (int i = mapVars.size() - 1; i >= 0; i--) {
+    auto candidate = mapVars[i];
+    auto track = getDeclaredOp(targetOp, candidate);
+    auto* declaredOp = track.empty() ? nullptr : track.back();
+    if (!declaredOp || !funcOp->isAncestor(declaredOp) || isTargetOrPointer(declaredOp)) {
+      continue;
+    }
+
+    bool hasDeclared = false;
+    for (auto* op: track) {
+      if (llvm::isa<hlfir::DeclareOp>(op)) {
+        hasDeclared = true;
+        break;
+      }
+    }
+    if (!hasDeclared) continue;
+
+    assert(llvm::isa<fir::AllocaOp>(declaredOp));
+    llvm::errs() << "\n I have a temp: ";
+    declaredOp->print(llvm::errs());
+    llvm::errs() << "\n";
+    IRMapping vmap;
+    bool canCloneSafely = true;
+
+    for (auto* op : llvm::reverse(track)) {
+      if (llvm::isa<omp::MapInfoOp>(op)) continue; 
+
+      for (Value operand : op->getOperands()) {
+        if (vmap.contains(operand)) continue;
+        if (operand.getDefiningOp() && operand.getDefiningOp()->hasTrait<OpTrait::ConstantLike>()) {
+          opBuilder.clone(*operand.getDefiningOp(), vmap);
+        } else {
+          canCloneSafely = false; 
+          break;
+        }
+      }
+      
+      if (!canCloneSafely) break;
+      opBuilder.clone(*op, vmap);
+    }
+
+    if (!canCloneSafely) continue;
+    auto mapInfoOp = llvm::cast<omp::MapInfoOp>(candidate.getDefiningOp());
+    Value localReplacedValue = vmap.lookupOrNull(mapInfoOp.getVarPtr());
+    assert(localReplacedValue && "Local definition not found in vmap!");
+
+    int argIdx = mapVarOffset + i;
+    entryBlock.getArgument(argIdx).replaceAllUsesWith(localReplacedValue);
+    tempMapVarIndices.push_back(i);
+  }
+
+  llvm::sort(tempMapVarIndices.begin(), tempMapVarIndices.end());
+
+  for (int i = tempMapVarIndices.size() - 1; i >= 0; i--) {
+    auto mapVarIdx = tempMapVarIndices[i];
+    auto argIdx = mapVarOffset + mapVarIdx;
+    
+    assert(entryBlock.getArgument(argIdx).getUses().empty());
+    entryBlock.eraseArgument(argIdx);
+    targetOp.getMapVarsMutable().erase(mapVarIdx);
+  }
+}
+
+using PrivateOmpOp = std::variant<omp::TeamsOp, 
+                                  omp::ParallelOp, 
+                                  omp::DistributeOp,
+                                  omp::WsloopOp, 
+                                  omp::SimdOp>;
+
 
 static unsigned getReductionVarsOffset(Operation* wrapper) {
   auto offset = 0;
@@ -244,13 +379,11 @@ static void removePrivateVarsFromMapEntry(
   auto mapVarsOffSet = getBlockMapVarsOffset(targetOp);
   
   auto updatePromotedArgs = [&](int rmIdx) -> void {
-    for (size_t i = 0; i < promotedArgs.size(); i++) {
+    for (int i = promotedArgs.size() - 1; i >= 0; i--) {
       if (promotedArgs[i] == rmIdx) {
         promotedArgs.erase(promotedArgs.begin() + i);
       } else if (promotedArgs[i] > rmIdx) {
         promotedArgs[i] -= 1;
-      } else {
-        // promotedArgs[i] < rmIdx, do nothing
       }
     }
   };
@@ -473,7 +606,6 @@ static void absorbHostEvalVarsToMapEntries(
   llvm::SmallVector<unsigned> indicesForAbsorbedToBody;
   llvm::SmallVector<unsigned> indicesForAbsorbedToMapVars;
   for (unsigned i = 0; i < targetOp.numHostEvalBlockArgs(); i++) {
-    // TODO: we can fold some constant arguments so not necessarily migrate all hostEvalIndices.
     auto arg = targetOp.getHostEvalVars()[i];
     if (matchPattern(arg, m_Constant())) {
       indicesForAbsorbedToBody.push_back(i);
@@ -561,10 +693,8 @@ public:
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
     for (auto targetOp : targetOps) {
-      // Block argument indices of arguments been promoted from HostEvalVars to MapVars
-      llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
-
       if (targetOp->walk([](omp::WorkdistributeOp) { return WalkResult::interrupt();}).wasInterrupted()) {
+        // FIXME: unify the logic with the next branch
         auto &region = targetOp.getRegion();
         auto &block = region.front();
         auto mapVarsMutable = targetOp.getMapVarsMutable();
@@ -601,10 +731,27 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
+        llvm::errs() << "\nBefore compile:>>>\n";
+        moduleOp->dumpPretty();
+        llvm::errs() << "\n<<<Before End.\n";
+
+
+        llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
+
+        llvm::errs() << "\nAfter Flatten:>>>\n";
+        moduleOp->dumpPretty();
+        llvm::errs() << "\n<<<Flatten End.\n";
+
+
+        handleTemporaryVariables(targetOp, opBuilder);
+
+        llvm::errs() << "\nAfter compile:>>>\n";
+        moduleOp->dumpPretty();
+        llvm::errs() << "\n<<<After End.\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
@@ -618,11 +765,6 @@ public:
             b, targetOp.getLoc(), "kernel",
             FunctionType::get(&context, targetOp.getRegion().begin()->getArgumentTypes(), {}));
         b.cloneRegionBefore(targetOp.getRegion(), f.getRegion(), f.getRegion().begin());
-        for (const auto& argIdx: indicesForAbsorbedHostEvalVars) {
-          f.setArgAttr(argIdx, "llvm.noalias", b.getUnitAttr());
-          f.setArgAttr(argIdx, "llvm.readonly", b.getUnitAttr());
-        }
-
         llvm::raw_string_ostream os(str);
         os << *f;
         f->erase();
