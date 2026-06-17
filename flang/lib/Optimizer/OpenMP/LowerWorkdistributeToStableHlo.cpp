@@ -423,6 +423,9 @@ static void assignToLocalAlloca(
     mapVarVal.printAsOperand(llvm::dbgs(), {});
     auto finalVal = materializeValue(mapVarVal, scanResult.dataDAG, cloneCache, opBuilder);
     hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), finalVal, replacementVal);
+  } else {
+    auto zeroConstant = arith::getZeroConstant(opBuilder, targetOp.getLoc(), fir::unwrapRefType(replacementVal.getType()));
+    hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), zeroConstant, replacementVal);
   }
   llvm::dbgs() << " .\n";
 }
@@ -433,7 +436,7 @@ static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilde
   auto funcArgs = funcOp.getRegion().front().getArguments(); 
   auto funcArgsSet = llvm::DenseSet<Value>(funcArgs.begin(), funcArgs.end());
   auto scanResult = scanValuesUntilTarget(targetOp);
-  scanResult.print();
+  // scanResult.print();
   auto mapVarOffset = getBlockMapVarsOffset(targetOp);
   assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
 
@@ -988,11 +991,14 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
+        // llvm::dbgs() << "\nA1:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA1 End\n";
         llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
+        // llvm::dbgs() << "\nA2:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA2 End\n";
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
+        // llvm::dbgs() << "\nA3:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3 End\n";
 
         PassManager pm(&context);
         pm.addPass(mlir::createCSEPass());
@@ -1002,7 +1008,9 @@ public:
           // TODO: should have fallback processing!
           std::exit(EXIT_FAILURE);
         };
+        // llvm::dbgs() << "\nA4:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
         handleTemporaryVariables(targetOp, opBuilder);
+        // llvm::dbgs() << "\nA5:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
