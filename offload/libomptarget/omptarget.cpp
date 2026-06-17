@@ -2347,8 +2347,10 @@ int targetJit(ident_t *Loc, DeviceTy &Device, void *HostPtr, void *JitCode,
   }
 
   void *TgtEntryPtr = TargetTable->EntriesBegin[TM->Index].Address;
-  llvm::dbgs() << 
-    llvm::formatv("Launching target jit execution {0} with pointer {1} (index={3}).\n", TargetTable->EntriesBegin[TM->Index].SymbolName, DPxPTR(TgtEntryPtr), TM->Index);
+  ODBG(ODT_Kernel) << "Launching target execution "
+                   << TargetTable->EntriesBegin[TM->Index].SymbolName
+                   << " with pointer " << TgtEntryPtr << " (index=" << TM->Index
+                   << ").";
   {
     assert(KernelArgs.NumArgs == TgtArgs.size() && "Argument count mismatch!");
     TIMESCOPE_WITH_DETAILS_AND_IDENT(
