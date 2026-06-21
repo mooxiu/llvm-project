@@ -47,6 +47,7 @@
 #include <mlir/IR/BuiltinTypes.h>
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/IRMapping.h>
+#include <mlir/IR/Location.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/PatternMatch.h>
@@ -222,73 +223,100 @@ struct ScanResult {
   }
 };
 
-static ScanResult scanValuesUntilTarget(omp::TargetOp targetOp) {
-  ScanResult res;
-
+static std::optional<ScanResult> scanValuesUntilTarget(omp::TargetOp targetOp) {
   auto funcOp = targetOp->getParentOfType<func::FuncOp>();
-  assert(targetOp->getBlock() == &funcOp.getRegion().front());
+  llvm::SmallVector<Operation*> scanRoute;
+  scanRoute.push_back(targetOp);
+  auto* currBlock = targetOp->getBlock();
+  while (currBlock->getParentOp() != funcOp) {
+    auto* parentOp = currBlock->getParentOp();
+    // INFO: target might be under if condition
+    if (auto ifOp = llvm::dyn_cast<fir::IfOp>(parentOp)) {
+      scanRoute.push_back(ifOp);
+      currBlock = ifOp->getBlock();
+    } else {
+      llvm::dbgs() << "\nCannot scan due to unsupported parentOp:\n";
+      parentOp->print(llvm::dbgs(), {}); 
+      return std::nullopt;
+    }
+  }
+  std::reverse(scanRoute.begin(), scanRoute.end());
+
+  ScanResult res;
   auto& entryBlock = funcOp.getRegion().front();
   for (auto arg : entryBlock.getArguments()) {
     res.assignValueToMem(arg, arg);
   }
 
-  Operation& op = entryBlock.getOperations().front();
-  Operation* opPtr = &op;
-  while (opPtr != targetOp) {
-    // TODO: consider the case when we have multiple targetOp, we should be able to skip the previous one!
-    if (opPtr->getNumRegions() > 0) {
-      llvm::errs() << "Unexpected Operation!\n";
-      std::exit(EXIT_FAILURE);
+  auto scanUntil = [&](Operation* stopOp) -> bool {
+    Operation& op = stopOp->getBlock()->getOperations().front();
+    Operation* opPtr = &op;
+    while (opPtr != stopOp) {
+      // TODO: consider the case when we have multiple targetOp, we should be able to skip the previous one!
+      if (opPtr->getNumRegions() > 0) {
+        llvm::errs() << "\nUnexpected Operation!\n";
+        opPtr->print(llvm::errs(), {}); 
+        auto lineColLoc = llvm::dyn_cast<FileLineColLoc>(targetOp.getLoc());
+        if (lineColLoc) {
+          llvm::errs() << "\n File name:" << lineColLoc.getFilename().getValue();
+        }
+        llvm::errs() << "\n";
+        return false;
+      }
+      llvm::TypeSwitch<Operation*>(opPtr)
+        .Case([&](fir::AllocaOp allocaOp){res.newMem(allocaOp.getResult());})
+        .Case([&](fir::StoreOp storeOp){res.assignValueToMem(storeOp.getMemref(), storeOp.getValue());})
+        .Case([&](hlfir::AssignOp assignOp){res.assignValueToMem(assignOp.getLhs(), assignOp.getRhs());})
+        // TODO: need to check the case of slice!
+        .Case([&](hlfir::DeclareOp declareOp){
+          assert(declareOp.getNumResults() == 2);
+          res.bindMems(declareOp.getMemref(), declareOp.getResult(0));
+          res.bindMems(declareOp.getMemref(), declareOp.getResult(1));
+        })
+        .Case([&](fir::ConvertOp convertOp){
+          // TODO: check this
+          if (llvm::isa<fir::ReferenceType>(convertOp.getResult().getType())) {
+            res.bindMems(convertOp.getOperand(), convertOp.getResult());
+          } else {
+            res.flowValue(convertOp.getResult(), convertOp);
+          }
+        })
+        .Case([&](fir::LoadOp loadOp){res.loadValue(loadOp.getResult(), loadOp.getMemref());})
+        .Case([&](fir::AddrOfOp addrOp){res.newMem(addrOp.getResult());}) // TODO: in fact I should just ignore this, but I also need to trim the whole chain
+        // %303 = omp.map.info var_ptr(%4#1 : !fir.ref<i32>, i32) map_clauses(implicit) capture(ByCopy) -> !fir.ref<i32> {name = "i"}
+        .Case([&](omp::MapInfoOp mapInfoOp){
+          if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
+            assert((uint32_t(mapInfoOp.getMapType()) & uint32_t(omp::ClauseMapFlags::from)) == 0); // NOTE:maybe not necessary
+            res.copyMem(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
+          } else if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
+            assert((uint32_t(mapInfoOp.getMapType()) & uint32_t(omp::ClauseMapFlags::from)) != 0); // NOTE:maybe not necessary
+            res.bindMems(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
+          } else {
+            llvm::errs() << "Unexpected operation!";
+            mapInfoOp->print(llvm::errs());
+            llvm::errs() << "\n";
+            std::exit(EXIT_FAILURE);
+          }
+        })
+        .Default([&](auto){
+          // arith, math, complex
+          if (mlir::isPure(opPtr) && opPtr->getNumResults() == 1) {
+            res.flowValue(opPtr->getResult(0), opPtr);
+          } else {
+            llvm::dbgs() << "Skipped operation:";
+            opPtr->print(llvm::dbgs());
+            llvm::dbgs() << "\n";
+          }
+        })
+      ;
+      opPtr = opPtr->getNextNode();
     }
-    llvm::TypeSwitch<Operation*>(opPtr)
-      .Case([&](fir::AllocaOp allocaOp){res.newMem(allocaOp.getResult());})
-      .Case([&](fir::StoreOp storeOp){res.assignValueToMem(storeOp.getMemref(), storeOp.getValue());})
-      .Case([&](hlfir::AssignOp assignOp){res.assignValueToMem(assignOp.getLhs(), assignOp.getRhs());})
-      // TODO: need to check the case of slice!
-      .Case([&](hlfir::DeclareOp declareOp){
-        assert(declareOp.getNumResults() == 2);
-        res.bindMems(declareOp.getMemref(), declareOp.getResult(0));
-        res.bindMems(declareOp.getMemref(), declareOp.getResult(1));
-      })
-      .Case([&](fir::ConvertOp convertOp){
-        // TODO: check this
-        if (llvm::isa<fir::ReferenceType>(convertOp.getResult().getType())) {
-          res.bindMems(convertOp.getOperand(), convertOp.getResult());
-        } else {
-          res.flowValue(convertOp.getResult(), convertOp);
-        }
-      })
-      .Case([&](fir::LoadOp loadOp){res.loadValue(loadOp.getResult(), loadOp.getMemref());})
-      .Case([&](fir::AddrOfOp addrOp){res.newMem(addrOp.getResult());}) // TODO: in fact I should just ignore this, but I also need to trim the whole chain
-      // %303 = omp.map.info var_ptr(%4#1 : !fir.ref<i32>, i32) map_clauses(implicit) capture(ByCopy) -> !fir.ref<i32> {name = "i"}
-      .Case([&](omp::MapInfoOp mapInfoOp){
-        if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
-          assert((uint32_t(mapInfoOp.getMapType()) & uint32_t(omp::ClauseMapFlags::from)) == 0); // NOTE:maybe not necessary
-          res.copyMem(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-        } else if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
-          assert((uint32_t(mapInfoOp.getMapType()) & uint32_t(omp::ClauseMapFlags::from)) != 0); // NOTE:maybe not necessary
-          res.bindMems(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-        } else {
-          llvm::errs() << "Unexpected operation!";
-          mapInfoOp->print(llvm::errs());
-          llvm::errs() << "\n";
-          std::exit(EXIT_FAILURE);
-        }
-      })
-      .Default([&](auto){
-        // arith, math, complex
-        if (mlir::isPure(opPtr) && opPtr->getNumResults() == 1) {
-          res.flowValue(opPtr->getResult(0), opPtr);
-        } else {
-          llvm::dbgs() << "Skipped operation:";
-          opPtr->print(llvm::dbgs());
-          llvm::dbgs() << "\n";
-        }
-      })
-    ;
-    opPtr = opPtr->getNextNode();
+    return true;
+  };
+  for (auto* op: scanRoute) {
+    if (!scanUntil(op)) return std::move(res);
   }
-  return res;
+  return std::move(res);
 }
 
 static bool dependOnArg(
@@ -339,7 +367,10 @@ static bool shouldFold(
   }
   if (!(hasDeclared && isLocallyAllocated)) return false;
 
-  assert(sr.memToAliasVar.contains(candidate)); // Should not skip any mem during the scan.
+  if (!sr.memToAliasVar.contains(candidate)) {
+    // likely there are some unexpected operations block the analysis, so we cannot fold it, conservatively, suppose we can not fold the candidate.
+    return false;
+  }
   auto* aV = sr.memToAliasVar.at(candidate);
   if (aV->currentValue == nullptr) return true; // This belongs to case (1).
   return !dependOnArg(aV->currentValue, sr.dataDAG, argsSet);
@@ -435,8 +466,10 @@ static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilde
   auto& entryBlock = targetOp.getRegion().front(); 
   auto funcArgs = funcOp.getRegion().front().getArguments(); 
   auto funcArgsSet = llvm::DenseSet<Value>(funcArgs.begin(), funcArgs.end());
-  auto scanResult = scanValuesUntilTarget(targetOp);
-  // scanResult.print();
+  auto scanResultOpt = scanValuesUntilTarget(targetOp);
+  if (!scanResultOpt.has_value()) return;
+  auto& scanResult = scanResultOpt.value();
+
   auto mapVarOffset = getBlockMapVarsOffset(targetOp);
   assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
 
