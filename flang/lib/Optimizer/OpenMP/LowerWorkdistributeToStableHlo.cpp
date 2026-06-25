@@ -29,11 +29,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/Casting.h"
-#include "llvm/Support/Debug.h"
-#include <clang/Basic/DiagnosticSema.h>
+#include "llvm/Support/DebugLog.h"
 #include <clang/Parse/Parser.h>
-#include <llvm/Support/DebugLog.h>
 #include <memory>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
@@ -44,6 +41,7 @@
 #include <mlir/Dialect/OpenMP/OpenMPOpsAttributes.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
 #include <mlir/Dialect/Utils/IndexingUtils.h>
+#include <mlir/IR/Attributes.h>
 #include <mlir/IR/Block.h>
 #include <mlir/IR/BlockSupport.h>
 #include <mlir/IR/BuiltinAttributeInterfaces.h>
@@ -56,6 +54,7 @@
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/Operation.h>
 #include <mlir/IR/PatternMatch.h>
+#include <mlir/IR/ValueRange.h>
 #include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Support/LLVM.h>
@@ -527,6 +526,9 @@ static Value getRootMem(Value mem) {
     if (auto allocaOp = llvm::dyn_cast<fir::AllocaOp>(defOp)) {
       return curr;
     }
+    if (auto addrOp = llvm::dyn_cast<fir::AddrOfOp>(defOp)) {
+      return curr;
+    }
     if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(defOp)) {
       if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
         return curr;
@@ -631,6 +633,7 @@ public:
           after->memoryMap[alloca.getResult()] = {MemoryValueState::State::Bottom, nullptr};
         })
         .Case([&](omp::MapInfoOp info){
+          // If byCopy, the root of the result is the result itself.
           if (info.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
             auto varPtrRoot = getRootMem(info.getVarPtr());
             if (after->memoryMap.contains(varPtrRoot)) {
@@ -710,8 +713,18 @@ enum struct Foldability: uint8_t {
 };
 
 static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir::DataFlowSolver& solver) {
+  llvm::dbgs() << "\n Checking: ";
+  val.printAsOperand(llvm::dbgs(), {});
+  llvm::dbgs() << "\n";
+
   if (argsSet.contains(val)) return true;
   auto* defOp = val.getDefiningOp();
+  if (!defOp) {
+    llvm::dbgs() << "\n Cannot find definition Op: ";
+    val.printAsOperand(llvm::dbgs(), {});
+    llvm::dbgs() << "\n";
+    std::exit(EXIT_FAILURE);
+  }
   if (auto loadOp = llvm::dyn_cast<fir::LoadOp>(defOp)) {
     auto root = getRootMem(loadOp.getMemref());
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
@@ -721,7 +734,16 @@ static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir
     return isDependOnArgs(state.storedValue, argsSet, solver);
   } 
   if (defOp->getNumOperands() == 0) {
-    assert(llvm::isa<arith::ConstantOp>(defOp));
+    if (!llvm::isa<arith::ConstantOp>(defOp)) {
+      llvm::errs() << "\nThe val is: \n";
+      val.printAsOperand(llvm::errs(), {});
+      llvm::errs() << "\n";
+      llvm::errs() << "\nThe wild defOp is: ";
+      defOp->print(llvm::errs());
+      llvm::errs() << "\n";
+      std::exit(EXIT_FAILURE);  
+    }
+    // assert(llvm::isa<arith::ConstantOp>(defOp));
     return false;
   }
   auto acc = false;
@@ -751,6 +773,7 @@ static Foldability checkFoldability(
   auto args = targetOp->getParentOfType<func::FuncOp>().getArguments();
   llvm::DenseSet<Value> argsSet(args.begin(), args.end());
   if (argsSet.contains(root)) return Foldability::Unfoldable;
+
   // INFO: if mapvar is unknown, we can fold in JIT.
   // assert(aliasLattice->memoryMap.contains(root));
   MemoryValueState valueState;
@@ -767,6 +790,10 @@ static Foldability checkFoldability(
   if (valueState.state == MemoryValueState::State::Bottom) return Foldability::AOTTempFold;
   // INFO: if the value can chase to be depend on any arg, then this is JITFold, else it is constantFold.
   assert(valueState.state == MemoryValueState::State::Known);
+  assert(valueState.storedValue != nullptr);
+  llvm::dbgs() << "\nWe're checking :";
+  valueState.storedValue.printAsOperand(llvm::dbgs(), {});
+  llvm::dbgs() << "\n";
   if (isDependOnArgs(valueState.storedValue, argsSet, solver)) {
     return Foldability::JITFold;
   }
@@ -822,6 +849,7 @@ static Value materializeValueV2(
   return cloneCache[mapVarFinalVal];
 }
                                                                                                                             
+// FIXME: not always track back to alloca, maybe track back to address_of
 static Value createLocalAllocaV2(
   Block& entryBlock,
   Value mapVar,
@@ -847,7 +875,7 @@ static Value createLocalAllocaV2(
   }
   mlir::Type valType = fir::unwrapRefType(replacementMem.getType());
   auto zeroConstant = fir::ZeroOp::create(opBuilder, targetOp.getLoc(), valType);
-  fir::StoreOp::create(opBuilder, targetOp.getLoc(), zeroConstant, replacementMem);
+  fir::StoreOp::create(opBuilder, targetOp.getLoc(), zeroConstant.getResult(), replacementMem);
   return replacementMem;
 }
                                                                                                                             
@@ -880,8 +908,6 @@ static void foldConstantPrivates(
   Block& entryBlock = targetOp.getRegion().front();
   
   llvm::DenseMap<Value, Value> cloneCache;
-  OpBuilder::InsertionGuard guard(opBuilder); 
-  opBuilder.setInsertionPointToStart(&entryBlock);
   auto mapVarOffset = getBlockMapVarsOffset(targetOp);
   assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
   
@@ -894,6 +920,8 @@ static void foldConstantPrivates(
     foldabilityMap[mapVar] = foldability;
   }
 
+  OpBuilder::InsertionGuard guardAOTFold(opBuilder); 
+  opBuilder.setInsertionPointToStart(&entryBlock);
   for (int i = int(targetOp.numMapBlockArgs()) - 1; i >= 0; i--) {
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
@@ -903,7 +931,7 @@ static void foldConstantPrivates(
       continue;
     }
     if (foldability == Foldability::AOTTempFold || foldability == Foldability::AOTConstFold) {
-      Value replacementMem = createLocalAllocaV2(entryBlock, mapVar, arg, opBuilder, targetOp);
+        Value replacementMem = createLocalAllocaV2(entryBlock, mapVar, arg, opBuilder, targetOp);
       if (foldability == Foldability::AOTConstFold) {
         assignToLocalAllocaV2(replacementMem, mapVar, targetOp, *aliasLattice, solver, opBuilder, cloneCache);
       }
@@ -915,13 +943,74 @@ static void foldConstantPrivates(
     }
   }
 
-  llvm::SmallVector<mlir::Attribute> jitArgAttrs;
-  for (uint i = 0; i < targetOp.numMapBlockArgs(); i++) {
+  OpBuilder::InsertionGuard guardJITFold(opBuilder); 
+  for (int i = int(targetOp.numMapBlockArgs()) - 1; i >= 0; i--) {
+    auto argIdx = mapVarOffset + i; 
+    auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
+    auto foldability = foldabilityMap[mapVar];
+    if (foldability == Foldability::JITFold) {
+      assert(arg.getNumUses() == 1); // should only have a declare operation
+      for (auto* user : arg.getUsers()) {
+        assert(llvm::isa<hlfir::DeclareOp>(user));
+        auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(user);
+        opBuilder.setInsertionPointAfter(declareOp);
+        auto inType = fir::unwrapRefType(declareOp.getMemref().getType());
+        if (declareOp.getShape()) {
+          auto shapeOp = llvm::dyn_cast<fir::ShapeOp>(declareOp.getShape().getDefiningOp());
+          assert(shapeOp);
+          auto allocaOp = fir::AllocaOp::create(
+            opBuilder, 
+            targetOp.getLoc(), 
+            inType,
+            /*uniqName=*/ "",
+            /*bindcName=*/ "",
+            /*typeparams=*/ mlir::ValueRange{},
+            {shapeOp.getExtents()}
+          );
+          auto neoDeclareOp = hlfir::DeclareOp::create(
+            opBuilder, 
+            targetOp.getLoc(), 
+            allocaOp.getResult(), 
+            /*uniq_name=*/"", 
+            declareOp.getShape(),
+            /*typeparams*/ mlir::ValueRange{},
+            declareOp.getDummyScope(),
+            declareOp.getStorage(),
+            declareOp.getStorageOffset(),
+            {},
+            {},
+            {}
+          );
+          declareOp.getResults().replaceAllUsesWith(neoDeclareOp);
+          hlfir::AssignOp::create(
+            opBuilder, 
+            targetOp.getLoc(), 
+            declareOp.getBase(),
+            neoDeclareOp.getBase()
+          );
+        } else {
+          // scalar
+          auto allocaOp = fir::AllocaOp::create(opBuilder, targetOp.getLoc(), inType, "", "", ValueRange{}, {}, {});
+          auto neoDeclareOp = hlfir::DeclareOp::create(opBuilder, targetOp.getLoc(), allocaOp.getResult(), "", {}, {}, declareOp.getDummyScope(), declareOp.getStorage(), declareOp.getStorageOffset(), {}, {}, {});
+          declareOp.getResults().replaceAllUsesWith(neoDeclareOp);
+          hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), declareOp.getBase(), neoDeclareOp.getBase());
+        }
+      }
+      continue;
+    }
+  }
+
+  // INFO: we have already declared shadowing alloca above, this is just for making debugging easier.
+  llvm::SmallVector<Attribute> jitArgAttrs;
+  for (const auto& mapVar: targetOp.getMapVars()) {
+    assert(foldabilityMap.contains(mapVar));
     if (foldabilityMap[mapVar] == Foldability::JITFold) {
-      jitArgAttrs.push_back(opBuilder.getStringAttr("jit-fold"));
+      auto strAttr = StringAttr::get(targetOp.getContext());      
+      jitArgAttrs.push_back(strAttr);
     } else {
-      jitArgAttrs.push_back(opBuilder.getDictionaryAttr({}));
+      auto unitAttr = UnitAttr::get(targetOp.getContext());
+      jitArgAttrs.push_back(unitAttr);
     }
   }
   targetOp->setAttr("jit_foldability", opBuilder.getArrayAttr(jitArgAttrs));
@@ -1413,19 +1502,7 @@ public:
     moduleOp.walk(
         [&](omp::TargetOp targetOp) { targetOps.push_back(targetOp); });
 
-    DataFlowSolver solver;
-    if (!targetOps.empty()) {
-      // FIXME: also require does not contain workdistribute
-      auto funcOp = targetOps.front()->getParentOfType<func::FuncOp>();
-      assert(funcOp);
-      solver.load<dataflow::DeadCodeAnalysis>(); // TODO: this should be loaded, but I comment it out to check the error message
-      solver.load<TargetFoldabilityAnalysis>(funcOp);
-      if (mlir::failed(solver.initializeAndRun(funcOp))) {
-        moduleOp.emitError("Dataflow analysis failed to coverage");
-        return;
-      }
-    }
-
+    
     for (auto targetOp : targetOps) {
       if (targetOp->walk([](omp::WorkdistributeOp) { return WalkResult::interrupt();}).wasInterrupted()) {
         // FIXME: unify the logic with the next branch
@@ -1483,9 +1560,19 @@ public:
           std::exit(EXIT_FAILURE);
         };
 
-        llvm::dbgs() << "\nA4:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
+        DataFlowSolver solver;
+        auto funcOp = targetOp->getParentOfType<func::FuncOp>();
+        assert(funcOp);
+        solver.load<dataflow::DeadCodeAnalysis>(); // TODO: this should be loaded, but I comment it out to check the error message
+        solver.load<TargetFoldabilityAnalysis>(funcOp);
+        if (mlir::failed(solver.initializeAndRun(funcOp))) {
+          moduleOp.emitError("Dataflow analysis failed to coverage");
+          return;
+        }
+
+        // llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
         foldConstantPrivates(targetOp, opBuilder, solver);
-        // llvm::dbgs() << "\nA5:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
+        // llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
