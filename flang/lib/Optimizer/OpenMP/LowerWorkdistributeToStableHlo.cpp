@@ -86,397 +86,6 @@ static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
 }
 
 
-// TODO: this might not be necessary as we only what to know if it is defined by an alloca or not?
-// Originally I think I need to splice all the track to the definition, but actually I can just shadow this.
-static std::optional<llvm::SmallVector<Operation*>> getSortedDefinitionTrack(omp::TargetOp targetOp, const Value& candidate) {
-  llvm::SmallVector<Operation*> track;
-
-  auto subroutineFunc = targetOp->getParentOfType<func::FuncOp>();
-  auto curr = candidate;
-  auto* definedOp = curr.getDefiningOp();
-  track.push_back(definedOp);
-  auto shouldEnd = [&](Operation* definedOp) -> bool {
-    if (!definedOp) return true; // also include the case when val is in block
-    return llvm::isa<fir::AllocaOp>(definedOp) || !subroutineFunc->isAncestor(definedOp);
-  };
-
-  while (!shouldEnd(definedOp)) {
-    if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
-      curr = mapInfoOp.getVarPtr();
-      definedOp = curr.getDefiningOp(); 
-      track.push_back(definedOp);
-      continue;
-    } 
-    if (auto viewOp = llvm::dyn_cast<mlir::ViewLikeOpInterface>(definedOp)) {
-      curr = viewOp.getViewSource();
-      definedOp = curr.getDefiningOp();
-      track.push_back(definedOp);
-      continue;
-    }
-    if (auto hlfirDeclareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
-      curr = hlfirDeclareOp.getMemref();
-      definedOp = curr.getDefiningOp();
-      track.push_back(definedOp);
-      continue;
-    }
-    // unexepected situation, should 
-    llvm::dbgs() << "Unexpected Situation: ";
-    definedOp->print(llvm::dbgs());
-    llvm::dbgs() << "\n";
-    track.push_back(nullptr);
-    break;
-  }
-  if (!track[track.size() - 1]) {return std::nullopt;}
-  std::reverse(track.begin(), track.end());
-  return track;
-}
-
-struct AliasVar {
-  llvm::DenseSet<Value> aliasSet;
-  Value currentValue;
-};
-
-struct ScanResult {
-  llvm::SmallVector<std::unique_ptr<AliasVar>> aliasVarStorage;
-  llvm::DenseMap<Value, AliasVar*> memToAliasVar;
-  llvm::DenseMap<Value, std::pair<Value, Operation*>> dataDAG;
-
-  // e.g. mem = fir.alloca
-  void newMem(Value mem) {
-    assert(!memToAliasVar.contains(mem));
-    auto aliasVar = std::make_unique<AliasVar>();
-    aliasVar->aliasSet.insert(mem);
-    aliasVar->currentValue = nullptr;
-
-    memToAliasVar[mem] = aliasVar.get();
-    aliasVarStorage.push_back(std::move(aliasVar));
-    return;
-  }
-
-  // e.g. fir.store val to mem, hlfir.assign val to mem
-  void assignValueToMem(Value mem, Value val) {
-    if (!memToAliasVar.contains(mem)) {
-      newMem(mem);
-    }
-    assert(memToAliasVar.contains(mem));
-    memToAliasVar[mem]->currentValue = val;
-    return;
-  };
-
-  // e.g. newMem = hlfir.declare(oldMem)
-  // e.g. memCopiedTo = map.info var_ptr(memCopiedFrom) map_clauses(implicit ToFrom) capture(ByRef)
-  void bindMems(Value oldMem, Value newMem) {
-    assert(memToAliasVar.contains(oldMem));
-    auto* aV = memToAliasVar[oldMem];
-    aV->aliasSet.insert(newMem);
-    memToAliasVar[newMem] = aV;
-    return;
-  }
-
-  // e.g. memCopiedTo = map.info var_ptr(memCopiedFrom) map_clauses(implicit) capture(ByCopy)
-  void copyMem(Value memCopiedFrom, Value memCopiedTo) {
-    newMem(memCopiedTo);
-    assert(memToAliasVar.contains(memCopiedTo));
-    assert(memToAliasVar.contains(memCopiedFrom));
-    memToAliasVar[memCopiedTo]->currentValue = memToAliasVar[memCopiedFrom]->currentValue;
-    return;
-  }
-
-  void loadValue(Value val, Value memLoadFrom) {
-    assert(memToAliasVar.contains(memLoadFrom));
-    assert(!dataDAG.contains(val));
-    dataDAG[val] = std::make_pair(memToAliasVar[memLoadFrom]->currentValue, nullptr); 
-    return;
-  }
-
-  void flowValue(Value val, Operation* op) {
-    assert(!dataDAG.contains(val));
-    dataDAG[val] = std::make_pair(nullptr, op);
-    return;
-  }
-};
-
-// TODO: this might be easier to achieve through MLIR's dataflow analysis framework... 
-[[deprecated("Use framework")]]
-static std::optional<ScanResult> scanValuesUntilTarget(omp::TargetOp targetOp) {
-  auto funcOp = targetOp->getParentOfType<func::FuncOp>();
-  llvm::SmallVector<Operation*> scanRoute;
-  scanRoute.push_back(targetOp);
-  auto* currBlock = targetOp->getBlock();
-  while (currBlock->getParentOp() != funcOp) {
-    auto* parentOp = currBlock->getParentOp();
-    // INFO: target might be under if condition
-    if (auto ifOp = llvm::dyn_cast<fir::IfOp>(parentOp)) {
-      scanRoute.push_back(ifOp);
-      currBlock = ifOp->getBlock();
-    } else {
-      llvm::dbgs() << "\nCannot scan due to unsupported parentOp:\n";
-      parentOp->print(llvm::dbgs(), {}); 
-      return std::nullopt;
-    }
-  }
-  std::reverse(scanRoute.begin(), scanRoute.end());
-
-  ScanResult res;
-  auto& entryBlock = funcOp.getRegion().front();
-  for (auto arg : entryBlock.getArguments()) {
-    res.assignValueToMem(arg, arg);
-  }
-
-  auto scanUntil = [&](Operation* stopOp) -> bool {
-    Operation& op = stopOp->getBlock()->getOperations().front();
-    Operation* opPtr = &op;
-    while (opPtr != stopOp) {
-      // TODO: consider the case when we have multiple targetOp, we should be able to skip the previous one!
-      if (opPtr->getNumRegions() > 0) {
-        llvm::errs() << "\nUnexpected Operation!\n";
-        opPtr->print(llvm::errs(), {}); 
-        auto lineColLoc = llvm::dyn_cast<FileLineColLoc>(targetOp.getLoc());
-        if (lineColLoc) {
-          llvm::errs() << "\n File name:" << lineColLoc.getFilename().getValue();
-        }
-        llvm::errs() << "\n";
-        return false;
-      }
-      llvm::TypeSwitch<Operation*>(opPtr)
-        .Case([&](fir::AllocaOp allocaOp){res.newMem(allocaOp.getResult());})
-        .Case([&](fir::StoreOp storeOp){res.assignValueToMem(storeOp.getMemref(), storeOp.getValue());})
-        .Case([&](hlfir::AssignOp assignOp){res.assignValueToMem(assignOp.getLhs(), assignOp.getRhs());})
-        // TODO: need to check the case of slice!
-        .Case([&](hlfir::DeclareOp declareOp){
-          assert(declareOp.getNumResults() == 2);
-          res.bindMems(declareOp.getMemref(), declareOp.getResult(0));
-          res.bindMems(declareOp.getMemref(), declareOp.getResult(1));
-        })
-        .Case([&](fir::ConvertOp convertOp){
-          // TODO: check this
-          if (llvm::isa<fir::ReferenceType>(convertOp.getResult().getType())) {
-            res.bindMems(convertOp.getOperand(), convertOp.getResult());
-          } else {
-            res.flowValue(convertOp.getResult(), convertOp);
-          }
-        })
-        .Case([&](fir::LoadOp loadOp){res.loadValue(loadOp.getResult(), loadOp.getMemref());})
-        .Case([&](fir::AddrOfOp addrOp){res.newMem(addrOp.getResult());}) // TODO: in fact I should just ignore this, but I also need to trim the whole chain
-        // %303 = omp.map.info var_ptr(%4#1 : !fir.ref<i32>, i32) map_clauses(implicit) capture(ByCopy) -> !fir.ref<i32> {name = "i"}
-        .Case([&](omp::MapInfoOp mapInfoOp){
-          if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
-            res.copyMem(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-          } else if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
-            res.bindMems(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-          } else {
-            llvm::errs() << "Unexpected operation!";
-            mapInfoOp->print(llvm::errs());
-            llvm::errs() << "\n";
-            std::exit(EXIT_FAILURE);
-          }
-        })
-        .Default([&](auto){
-          // arith, math, complex
-          if (mlir::isPure(opPtr) && opPtr->getNumResults() == 1) {
-            res.flowValue(opPtr->getResult(0), opPtr);
-          } else {
-            llvm::dbgs() << "Skipped operation:";
-            opPtr->print(llvm::dbgs());
-            llvm::dbgs() << "\n";
-          }
-        })
-      ;
-      opPtr = opPtr->getNextNode();
-    }
-    return true;
-  };
-  for (auto* op: scanRoute) {
-    if (!scanUntil(op)) return std::move(res);
-  }
-  return std::move(res);
-}
-
-[[deprecated("use framework instead")]]
-static bool dependOnArg(
-  const Value& val,
-  const llvm::DenseMap<Value, std::pair<Value, Operation*>>& dataDAG,
-  const llvm::DenseSet<Value>& argsSet
-) {
-  if (argsSet.contains(val)) return true;
-  assert(dataDAG.contains(val)); 
-  auto pair = dataDAG.at(val);
-  assert(!(pair.first && pair.second));
-  if (pair.first) {
-    return dependOnArg(pair.first, dataDAG, argsSet);
-  } 
-  assert(pair.second);
-  return llvm::any_of(pair.second->getOperands(), [&](const auto& operand) -> bool{return dependOnArg(operand, dataDAG, argsSet);});
-}
-
-// There are 3 possible situations for private and first private variables.
-// (1) Private locally allocated purely for storing temporary variables.
-// (2) First Private assigned with constant value before target region.
-// (3) First Private assigned depend on input arguments (runtime constants though).
-// Fold (1), (2); But not (3).
-[[deprecated("use framework")]]
-static bool shouldFold(
-  const Value& candidate,
-  const ScanResult& sr, 
-  func::FuncOp funcOp,
-  const llvm::SmallVector<Operation*> &definitionTrack,
-  const llvm::DenseSet<Value>& argsSet
-) {
-  auto* declaredOp = definitionTrack.empty() ? nullptr : definitionTrack.back();
-  auto isTargetOrPointer = [](Operation* definedOp) {
-    return false; // TODO: finish this method.
-  };
-  if (!declaredOp || !funcOp->isAncestor(declaredOp) || isTargetOrPointer(declaredOp)) {
-    return false;
-  }
-
-  bool hasDeclared = false; // This is to avoid folding shape metas.
-  bool isLocallyAllocated = false;
-  for (auto* op: definitionTrack) {
-    if (llvm::isa<hlfir::DeclareOp>(op)) {
-      hasDeclared = true;
-    } else if (llvm::isa<fir::AllocaOp>(op)) {
-      isLocallyAllocated = true;
-    }
-    if (hasDeclared && isLocallyAllocated) break;
-  }
-  if (!(hasDeclared && isLocallyAllocated)) return false;
-
-  if (!sr.memToAliasVar.contains(candidate)) {
-    // likely there are some unexpected operations block the analysis, so we cannot fold it, conservatively, suppose we can not fold the candidate.
-    return false;
-  }
-  auto* aV = sr.memToAliasVar.at(candidate);
-  if (aV->currentValue == nullptr) return true; // This belongs to case (1).
-  return !dependOnArg(aV->currentValue, sr.dataDAG, argsSet);
-}
-
-// Print the dataflow chain of val to the target location
-static Value materializeValue(
-  Value val, 
-  const llvm::DenseMap<Value, std::pair<Value, Operation*>>& dataDAG,
-  llvm::DenseMap<Value, Value>& cloneCache,
-  OpBuilder& opBuilder
-) {
-  assert(dataDAG.contains(val));
-  if (cloneCache.contains(val)) {
-    return cloneCache[val];
-  }
-  auto [upVal, defOp] = dataDAG.at(val);
-
-  // If only there is a value, transformed from a load operation.
-  assert(!(upVal && defOp));
-  assert(upVal || defOp);
-  if (upVal) {
-    auto result = materializeValue(upVal, dataDAG, cloneCache, opBuilder);
-    cloneCache[val] = result;
-    return result;
-  }
-
-  // If has a corresponding operation.
-  IRMapping vMap;
-  for (auto operand: defOp->getOperands()) {
-    vMap.map(operand, materializeValue(operand, dataDAG, cloneCache, opBuilder));
-  }
-  auto* newOp = opBuilder.clone(*defOp, vMap);
-  cloneCache[val] = newOp->getResult(0);
-  return cloneCache[val];
-}
-
-static Value createLocalAlloca(
-  const llvm::SmallVector<Operation*>& definitionTrack,
-  Block& entryBlock,
-  Value arg,
-  OpBuilder& opBuilder,
-  omp::TargetOp targetOp
-) {
-  auto oldAllocaOp = llvm::dyn_cast<fir::AllocaOp>(definitionTrack.front());
-  assert(oldAllocaOp);
-  
-  auto newAllocaOp = fir::AllocaOp::create(
-    opBuilder, 
-    targetOp.getLoc(), 
-    oldAllocaOp.getInType(), 
-    oldAllocaOp.getUniqName().has_value()? oldAllocaOp.getUniqName().value(): "",
-    oldAllocaOp.getBindcName().has_value()? oldAllocaOp.getBindcName().value(): "",
-    oldAllocaOp.getTypeparams(),
-    oldAllocaOp.getShape(),
-    oldAllocaOp->getAttrs()
-  );
-
-  mlir::Value replacementVal = newAllocaOp.getResult();
-  if (replacementVal.getType() != arg.getType()) {
-    replacementVal = fir::ConvertOp::create(opBuilder, targetOp.getLoc(), arg.getType(), replacementVal).getResult();
-  }
-  return replacementVal;
-}
-
-static void assignToLocalAlloca(
-  Value replacementVal,
-  omp::TargetOp targetOp,
-  int mapVarIdx,
-  const ScanResult& scanResult,
-  OpBuilder& opBuilder,
-  llvm::DenseMap<Value, Value>& cloneCache
-) {
-  auto mapVar = targetOp.getMapVars()[mapVarIdx];
-  assert(scanResult.memToAliasVar.contains(mapVar));
-  llvm::dbgs() << "Materialize the value for mapVar with index " << mapVarIdx << ", var: ";
-  mapVar.printAsOperand(llvm::dbgs(), {});
-  llvm::dbgs() << " , mapVarVal: ";
-  auto mapVarVal = scanResult.memToAliasVar.at(mapVar)->currentValue;
-  if (mapVarVal != nullptr) {
-    mapVarVal.printAsOperand(llvm::dbgs(), {});
-    auto finalVal = materializeValue(mapVarVal, scanResult.dataDAG, cloneCache, opBuilder);
-    hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), finalVal, replacementVal);
-  } else {
-    auto zeroConstant = arith::getZeroConstant(opBuilder, targetOp.getLoc(), fir::unwrapRefType(replacementVal.getType()));
-    hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), zeroConstant, replacementVal);
-  }
-  llvm::dbgs() << " .\n";
-}
-
-[[deprecated("use framework instead")]]
-static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilder) {
-  auto funcOp = targetOp->getParentOfType<func::FuncOp>();
-  auto& entryBlock = targetOp.getRegion().front(); 
-  auto funcArgs = funcOp.getRegion().front().getArguments(); 
-  auto funcArgsSet = llvm::DenseSet<Value>(funcArgs.begin(), funcArgs.end());
-  auto scanResultOpt = scanValuesUntilTarget(targetOp);
-  if (!scanResultOpt.has_value()) return;
-  auto& scanResult = scanResultOpt.value();
-
-  auto mapVarOffset = getBlockMapVarsOffset(targetOp);
-  assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
-
-  OpBuilder::InsertionGuard guard(opBuilder); 
-  opBuilder.setInsertionPointToStart(&entryBlock);
-  llvm::SmallVector<int> indicesToFold;
-  llvm::DenseMap<Value, Value> cloneCache;
-  for (int i = targetOp.getMapVars().size() - 1; i >= 0; i--) {
-    auto candidate = targetOp.getMapVars()[i];
-    auto definitionTrackOpt = getSortedDefinitionTrack(targetOp, candidate);
-    if (!definitionTrackOpt.has_value()) continue;
-    auto definitionTrack = definitionTrackOpt.value();
-    if (!shouldFold(candidate, scanResult, funcOp, definitionTrack, funcArgsSet)) continue;
-    assert(llvm::isa<fir::AllocaOp>(definitionTrack.front()));
-
-    indicesToFold.push_back(i);
-    auto argIdx = mapVarOffset + i; 
-    auto arg = entryBlock.getArgument(argIdx);
-    auto replacementVal = createLocalAlloca(definitionTrack, entryBlock, arg, opBuilder, targetOp);
-    assignToLocalAlloca(replacementVal, targetOp, i, scanResult, opBuilder, cloneCache);
-    arg.replaceAllUsesWith(replacementVal);
-    assert(arg.getUses().empty());
-    
-    // Clear the arguments
-    assert(entryBlock.getArgument(argIdx).getUses().empty());
-    entryBlock.eraseArgument(argIdx);
-    targetOp.getMapVarsMutable().erase(i);
-  }
-  return;
-}
-
 // Definition of state lattice.
 // Bottom: Minimum uncertainty, unitialized, unreacheable, etc..
 // Known: Known value.
@@ -713,10 +322,6 @@ enum struct Foldability: uint8_t {
 };
 
 static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir::DataFlowSolver& solver) {
-  llvm::dbgs() << "\n Checking: ";
-  val.printAsOperand(llvm::dbgs(), {});
-  llvm::dbgs() << "\n";
-
   if (argsSet.contains(val)) return true;
   auto* defOp = val.getDefiningOp();
   if (!defOp) {
@@ -821,7 +426,7 @@ static Operation* trackToAllocaOp(Value mem) {
 }
 
 // Print the dataflow chain of val to the target location
-static Value materializeValueV2(
+static Value materializeValue(
   Value mapVarFinalVal, 
   DataFlowSolver& solver,
   llvm::DenseMap<Value, Value>& cloneCache,
@@ -836,13 +441,13 @@ static Value materializeValueV2(
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
     assert(stat.state == MemoryValueState::State::Known);
-    cloneCache[mapVarFinalVal] = materializeValueV2(stat.storedValue, solver, cloneCache, opBuilder);
+    cloneCache[mapVarFinalVal] = materializeValue(stat.storedValue, solver, cloneCache, opBuilder);
   }
 
   // If has a corresponding operation.
   IRMapping vMap;
   for (auto operand: defOp->getOperands()) {
-    vMap.map(operand, materializeValueV2(operand, solver, cloneCache, opBuilder));
+    vMap.map(operand, materializeValue(operand, solver, cloneCache, opBuilder));
   }
   auto* newOp = opBuilder.clone(*defOp, vMap);
   cloneCache[mapVarFinalVal] = newOp->getResult(0);
@@ -850,7 +455,7 @@ static Value materializeValueV2(
 }
                                                                                                                             
 // FIXME: not always track back to alloca, maybe track back to address_of
-static Value createLocalAllocaV2(
+static Value createLocalAlloca(
   Block& entryBlock,
   Value mapVar,
   Value arg,
@@ -879,7 +484,7 @@ static Value createLocalAllocaV2(
   return replacementMem;
 }
                                                                                                                             
-static void assignToLocalAllocaV2(
+static void assignToLocalAlloca(
   Value replacementMem,
   Value mapVar,
   omp::TargetOp targetOp,
@@ -893,7 +498,7 @@ static void assignToLocalAllocaV2(
   auto mapVarVal = aliasLattice.memoryMap.at(root).storedValue;
   if (mapVarVal != nullptr) {
     mapVarVal.printAsOperand(llvm::dbgs(), {});
-    auto finalVal = materializeValueV2(mapVarVal, solver, cloneCache, opBuilder);
+    auto finalVal = materializeValue(mapVarVal, solver, cloneCache, opBuilder);
     fir::StoreOp::create(opBuilder, targetOp.getLoc(), finalVal, replacementMem);
   }
 }
@@ -931,9 +536,9 @@ static void foldConstantPrivates(
       continue;
     }
     if (foldability == Foldability::AOTTempFold || foldability == Foldability::AOTConstFold) {
-        Value replacementMem = createLocalAllocaV2(entryBlock, mapVar, arg, opBuilder, targetOp);
+        Value replacementMem = createLocalAlloca(entryBlock, mapVar, arg, opBuilder, targetOp);
       if (foldability == Foldability::AOTConstFold) {
-        assignToLocalAllocaV2(replacementMem, mapVar, targetOp, *aliasLattice, solver, opBuilder, cloneCache);
+        assignToLocalAlloca(replacementMem, mapVar, targetOp, *aliasLattice, solver, opBuilder, cloneCache);
       }
       arg.replaceAllUsesWith(replacementMem);
       assert(entryBlock.getArgument(argIdx).getUses().empty());
@@ -1542,7 +1147,7 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
-        // llvm::dbgs() << "\nA1:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA1 End\n";
+        llvm::dbgs() << "\nA1:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA1 End\n";
         llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
@@ -1572,7 +1177,7 @@ public:
 
         // llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
         foldConstantPrivates(targetOp, opBuilder, solver);
-        // llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
+        llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
