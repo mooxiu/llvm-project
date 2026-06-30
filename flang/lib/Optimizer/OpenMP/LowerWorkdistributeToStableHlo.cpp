@@ -29,9 +29,10 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/DebugLog.h"
-#include <clang/Parse/Parser.h>
-#include <memory>
+#include "llvm/ADT/TypeSwitch.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
 #include <mlir/Analysis/DataFlowFramework.h>
@@ -86,36 +87,64 @@ static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
 }
 
 
-// Definition of state lattice.
-// Bottom: Minimum uncertainty, unitialized, unreacheable, etc..
-// Known: Known value.
-// Top: Maximum uncertainty, unknown, for example, the join state of a value after assigned in an if block.
-struct MemoryValueState {
+struct SubState {
   enum class State {Bottom, Known, Top};
-
   State state = State::Bottom;
-  Value storedValue = nullptr;
+  Value value = nullptr;
 
-  bool operator==(const MemoryValueState &rhs) const {
+  bool operator==(const SubState &rhs) const {
     if (state != rhs.state) return false;
-    if (state == State::Known) return storedValue == rhs.storedValue;
+    if (state == State::Known) {
+      return value == rhs.value;
+    }
     return true;
   }
 
-  bool operator!=(const MemoryValueState &rhs) const {
-    return !(*this == rhs);
+  bool operator!=(const SubState &rhs) const {
+    return !(*this == rhs); 
   }
 
-  static MemoryValueState join(
-    const MemoryValueState& lhs, 
-    const MemoryValueState& rhs 
+  static SubState join(
+    const SubState& lhs, 
+    const SubState& rhs 
   ) {
     if (lhs.state == State::Top || rhs.state == State::Top) return {State::Top, nullptr};
     if (lhs.state == State::Bottom) return rhs;
     if (rhs.state == State::Bottom) return lhs;
     assert(lhs.state == State::Known && rhs.state == State::Known);
-    if (lhs.storedValue == rhs.storedValue) return lhs;
+    if (lhs.value == rhs.value) return lhs;
     return {State::Top, nullptr};
+  }
+};
+
+// Definition of state lattice.
+// Bottom: Minimum uncertainty, unitialized, unreacheable, etc..
+// Known: Known value.
+// Top: Maximum uncertainty, unknown, for example, the join state of a value after assigned in an if block.
+struct MemState {
+  SubState hostSubState = {SubState::State::Bottom, nullptr};
+  SubState deviceSubState = {SubState::State::Bottom, nullptr};
+  std::pair<unsigned, unsigned> refCountRange = {0, 0}; 
+
+  bool operator==(const MemState &rhs) const {
+    return (hostSubState == rhs.hostSubState)
+      && (deviceSubState == rhs.deviceSubState)
+      && (refCountRange == rhs.refCountRange);
+  }
+
+  bool operator!=(const MemState &rhs) const {
+    return !(*this == rhs);
+  }
+
+  static MemState join(
+    const MemState& lhs, 
+    const MemState& rhs 
+  ) {
+    MemState ms;
+    ms.hostSubState = SubState::join(lhs.hostSubState, rhs.hostSubState);
+    ms.deviceSubState = SubState::join(lhs.deviceSubState, rhs.deviceSubState);
+    ms.refCountRange = {std::min(lhs.refCountRange.first, rhs.refCountRange.first), std::max(lhs.refCountRange.second, rhs.refCountRange.second)};
+    return ms;
   }
 };
 
@@ -181,7 +210,7 @@ public:
   using dataflow::AbstractDenseLattice::AbstractDenseLattice;
 
   // Only record the root memory's MemoryValueState, so we need to use getRootMem function to get the root first.
-  llvm::DenseMap<Value, MemoryValueState> memoryMap;
+  llvm::DenseMap<Value, MemState> memoryMap;
 
   ChangeResult join(const mlir::dataflow::AbstractDenseLattice &rhs) override {
     auto changed = false; 
@@ -191,7 +220,7 @@ public:
       if (!memoryMap.contains(mem)) changed = true;
       auto lhsState = memoryMap[mem]; // auto create bottom if not exist 
       auto rhsState = rhsLattice.memoryMap.at(mem);
-      auto joinState = MemoryValueState::join(lhsState, rhsState);
+      auto joinState = MemState::join(lhsState, rhsState);
       if (lhsState != joinState) changed = true;
       memoryMap[mem] = joinState;
     }
@@ -205,6 +234,13 @@ class TargetFoldabilityAnalysis: public mlir::dataflow::DenseForwardDataFlowAnal
 private:
   func::FuncOp currentFunc;
 
+  void handleTargetOp(omp::TargetOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+  void handleTargetDataOp(omp::TargetDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+  void handleTargetUpdateOp(omp::TargetUpdateOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+  void handleTargetEnterDataOp(omp::TargetEnterDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+  void handleTargetExitDataOp(omp::TargetExitDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+
+
 public:
   TargetFoldabilityAnalysis(DataFlowSolver& solver, func::FuncOp func):
     DenseForwardDataFlowAnalysis(solver), currentFunc(func) {};
@@ -215,31 +251,23 @@ public:
     MemoryAliasLattice *after
   ) override { 
     after->memoryMap = before.memoryMap;
-
-    if (op->getParentOfType<omp::TargetOp>()) {
-      if (auto termOp = llvm::dyn_cast<omp::TerminatorOp>(op)) {
-        if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(termOp->getParentOp())) {
-          for (mlir::Value mapVar : targetOp.getMapVars()) {
-            if (auto mapInfo = llvm::dyn_cast_or_null<omp::MapInfoOp>(mapVar.getDefiningOp())) {
-              if (mapInfo.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
-                mlir::Value rootMem = getRootMem(mapInfo.getVarPtr());
-                after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
-              }
-            }
-          }
-        };
-      }
-      return mlir::success();
-    }
-
     if (op->getDialect()->getNamespace() == "arith") {
       // Skip and do not print log
       return mlir::success();
     }
-
     llvm::TypeSwitch<Operation*>(op)
+        .Case([&](omp::TargetOp targetOp){handleTargetOp(targetOp, before, after);})
+        .Case([&](omp::TargetDataOp targetDataOp){handleTargetDataOp(targetDataOp, before, after);})
+        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, before, after);})
+        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, before, after);})
+        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, before, after);})
         .Case([&](fir::AllocaOp alloca){
-          after->memoryMap[alloca.getResult()] = {MemoryValueState::State::Bottom, nullptr};
+          MemState s = {
+            {SubState::State::Bottom, nullptr},
+            {SubState::State::Bottom, nullptr},
+            {0, 0}
+          };
+          after->memoryMap[alloca.getResult()] = s;
         })
         .Case([&](omp::MapInfoOp info){
           // If byCopy, the root of the result is the result itself.
@@ -252,45 +280,44 @@ public:
               info.print(llvm::dbgs());
               llvm::dbgs() << ", root is: ";
               varPtrRoot.printAsOperand(llvm::dbgs(), {});
-              after->memoryMap[info.getResult()] = {MemoryValueState::State::Top, nullptr};
+              after->memoryMap[info.getResult()] = {
+                {SubState::State::Top, nullptr},
+                {SubState::State::Top, nullptr},
+                {0, UINT32_MAX}
+              };
             }
           } 
         })
         .Case([&](fir::StoreOp storeOp){
           auto rootMem = getRootMem(storeOp.getMemref());
           if (after->memoryMap.contains(rootMem)) {
-            MemoryValueState newState = {MemoryValueState::State::Known, storeOp.getValue()};
-            after->memoryMap[rootMem] = newState;
+            after->memoryMap[rootMem].hostSubState = {SubState::State::Known, storeOp.getValue()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of StoredOp: ";
             storeOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
+            after->memoryMap[rootMem] = {
+              {SubState::State::Top, nullptr},
+              {SubState::State::Top, nullptr},
+              {0, UINT32_MAX},
+           };
           }
         })
         .Case([&](hlfir::AssignOp assignOp){
           auto rootMem = getRootMem(assignOp.getLhs());
           if (after->memoryMap.contains(rootMem)) {
-            MemoryValueState newState = {MemoryValueState::State::Known, assignOp.getRhs()};
-            after->memoryMap[rootMem] = newState;
+            after->memoryMap[rootMem].hostSubState = {SubState::State::Known, assignOp.getRhs()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of assignOp: ";
             assignOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
-          }
-        })
-        .Case([&](omp::TargetUpdateOp updateOp) {
-          for (mlir::Value mapVar : updateOp.getMapVars()) {
-            if (auto mapInfo = llvm::dyn_cast_or_null<omp::MapInfoOp>(mapVar.getDefiningOp())) {
-              uint64_t mapType = (uint64_t)mapInfo.getMapType();
-              if ((mapType & (uint64_t)omp::ClauseMapFlags::from) != 0) {
-                 mlir::Value rootMem = getRootMem(mapInfo.getVarPtr());
-                 after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
-              }
-            }
+            after->memoryMap[rootMem] = {
+              {SubState::State::Top, nullptr},
+              {SubState::State::Top, nullptr},
+              {0, UINT32_MAX},
+            };
           }
         })
         .Case<omp::TargetOp, omp::MapBoundsOp, func::ReturnOp,
@@ -312,7 +339,11 @@ public:
     lattice->memoryMap.clear();
     if (!currentFunc || currentFunc.empty()) return;
     for (auto arg: currentFunc.getArguments()) {
-      lattice->memoryMap[arg] = {MemoryValueState::State::Known, arg};
+      lattice->memoryMap[arg] = {
+        {SubState::State::Known, arg},
+        {SubState::State::Top, nullptr},
+        {0, UINT32_MAX}
+      };
     }
   }
 };
@@ -335,8 +366,8 @@ static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(root));
     auto state = lattice->memoryMap.at(root);
-    assert(state.state == MemoryValueState::State::Known);
-    return isDependOnArgs(state.storedValue, argsSet, solver);
+    assert(state.hostSubState.state == SubState::State::Known);
+    return isDependOnArgs(state.hostSubState.value, argsSet, solver);
   } 
   if (defOp->getNumOperands() == 0) {
     if (!llvm::isa<arith::ConstantOp>(defOp)) {
@@ -381,7 +412,7 @@ static Foldability checkFoldability(
 
   // INFO: if mapvar is unknown, we can fold in JIT.
   // assert(aliasLattice->memoryMap.contains(root));
-  MemoryValueState valueState;
+  MemState valueState;
   if (aliasLattice->memoryMap.contains(root)) {
     valueState = aliasLattice->memoryMap.at(root);
   } else {
@@ -389,17 +420,17 @@ static Foldability checkFoldability(
     mapVar.printAsOperand(llvm::dbgs(), {});
     llvm::dbgs() << ", with root: \n",
     root.printAsOperand(llvm::dbgs(), {});
-    valueState = {MemoryValueState::State::Top, nullptr};
+    valueState = {MemState::State::Top, nullptr};
   }
-  if (valueState.state == MemoryValueState::State::Top) return Foldability::JITFold; 
-  if (valueState.state == MemoryValueState::State::Bottom) return Foldability::AOTTempFold;
+  if (valueState.hostState == MemState::State::Top) return Foldability::JITFold; 
+  if (valueState.hostState == MemState::State::Bottom) return Foldability::AOTTempFold;
   // INFO: if the value can chase to be depend on any arg, then this is JITFold, else it is constantFold.
-  assert(valueState.state == MemoryValueState::State::Known);
-  assert(valueState.storedValue != nullptr);
+  assert(valueState.hostState == MemState::State::Known);
+  assert(valueState.hostValue != nullptr);
   llvm::dbgs() << "\nWe're checking :";
-  valueState.storedValue.printAsOperand(llvm::dbgs(), {});
+  valueState.hostValue.printAsOperand(llvm::dbgs(), {});
   llvm::dbgs() << "\n";
-  if (isDependOnArgs(valueState.storedValue, argsSet, solver)) {
+  if (isDependOnArgs(valueState.hostValue, argsSet, solver)) {
     return Foldability::JITFold;
   }
   return Foldability::AOTConstFold;
@@ -440,8 +471,8 @@ static Value materializeValue(
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
-    assert(stat.state == MemoryValueState::State::Known);
-    cloneCache[mapVarFinalVal] = materializeValue(stat.storedValue, solver, cloneCache, opBuilder);
+    assert(stat.hostState == MemState::State::Known);
+    cloneCache[mapVarFinalVal] = materializeValue(stat.hostValue, solver, cloneCache, opBuilder);
   }
 
   // If has a corresponding operation.
@@ -495,7 +526,7 @@ static void assignToLocalAlloca(
 ) {
   auto root = getRootMem(mapVar);
   assert(aliasLattice.memoryMap.contains(root));
-  auto mapVarVal = aliasLattice.memoryMap.at(root).storedValue;
+  auto mapVarVal = aliasLattice.memoryMap.at(root).hostValue;
   if (mapVarVal != nullptr) {
     mapVarVal.printAsOperand(llvm::dbgs(), {});
     auto finalVal = materializeValue(mapVarVal, solver, cloneCache, opBuilder);
