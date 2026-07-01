@@ -30,6 +30,7 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/DebugLog.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -234,6 +235,7 @@ class TargetFoldabilityAnalysis: public mlir::dataflow::DenseForwardDataFlowAnal
 private:
   func::FuncOp currentFunc;
 
+  // TODO: implement! 
   void handleTargetOp(omp::TargetOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
   void handleTargetDataOp(omp::TargetDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
   void handleTargetUpdateOp(omp::TargetUpdateOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
@@ -389,7 +391,7 @@ static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir
   return acc;
 }
 
-static Foldability checkFoldability(
+static std::pair<Foldability, Value> checkFoldability(
   Value arg, 
   Value mapVar, 
   omp::TargetOp targetOp, 
@@ -401,14 +403,14 @@ static Foldability checkFoldability(
   for (Operation* user: arg.getUsers()) {
     if (llvm::isa<hlfir::DeclareOp>(user)) declared = true;
   }
-  if (!declared) return Foldability::Unfoldable;
+  if (!declared) return {Foldability::Unfoldable, nullptr};
 
   
   // INFO: if mapVar is arg, we cannot fold.
   auto root = getRootMem(mapVar);
   auto args = targetOp->getParentOfType<func::FuncOp>().getArguments();
   llvm::DenseSet<Value> argsSet(args.begin(), args.end());
-  if (argsSet.contains(root)) return Foldability::Unfoldable;
+  if (argsSet.contains(root)) return {Foldability::Unfoldable, nullptr};
 
   // INFO: if mapvar is unknown, we can fold in JIT.
   // assert(aliasLattice->memoryMap.contains(root));
@@ -420,20 +422,33 @@ static Foldability checkFoldability(
     mapVar.printAsOperand(llvm::dbgs(), {});
     llvm::dbgs() << ", with root: \n",
     root.printAsOperand(llvm::dbgs(), {});
-    valueState = {MemState::State::Top, nullptr};
+    valueState = {{SubState::State::Top, nullptr}, {SubState::State::Top, nullptr}, {0, UINT32_MAX}};
   }
-  if (valueState.hostState == MemState::State::Top) return Foldability::JITFold; 
-  if (valueState.hostState == MemState::State::Bottom) return Foldability::AOTTempFold;
-  // INFO: if the value can chase to be depend on any arg, then this is JITFold, else it is constantFold.
-  assert(valueState.hostState == MemState::State::Known);
-  assert(valueState.hostValue != nullptr);
+
+  SubState joinedState;
+  if (valueState.refCountRange.first == 0 && valueState.refCountRange.second == 0) {
+    // not mapped
+    joinedState = valueState.hostSubState;
+  } else if (valueState.refCountRange.first == 0) {
+    assert(valueState.refCountRange.second > 0);
+    joinedState = SubState::join(valueState.hostSubState, valueState.deviceSubState);
+  } else {
+    assert(valueState.refCountRange.first > 0);
+    // already mapped
+    joinedState = valueState.deviceSubState;
+  }
+
+  if (joinedState.state == SubState::State::Top) return {Foldability::JITFold, joinedState.value}; 
+  if (joinedState.state == SubState::State::Bottom) return {Foldability::AOTTempFold, joinedState.value};
+  assert(joinedState.state == SubState::State::Known);
+  assert(joinedState.value != nullptr);
   llvm::dbgs() << "\nWe're checking :";
-  valueState.hostValue.printAsOperand(llvm::dbgs(), {});
+  joinedState.value.printAsOperand(llvm::dbgs(), {});
   llvm::dbgs() << "\n";
-  if (isDependOnArgs(valueState.hostValue, argsSet, solver)) {
-    return Foldability::JITFold;
+  if (isDependOnArgs(joinedState.value, argsSet, solver)) {
+    return {Foldability::JITFold, joinedState.value};
   }
-  return Foldability::AOTConstFold;
+  return {Foldability::AOTConstFold, joinedState.value};
 }
 
 static Operation* trackToAllocaOp(Value mem) {
@@ -471,8 +486,8 @@ static Value materializeValue(
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
-    assert(stat.hostState == MemState::State::Known);
-    cloneCache[mapVarFinalVal] = materializeValue(stat.hostValue, solver, cloneCache, opBuilder);
+    //FIXME: this is not correct!!!!
+    cloneCache[mapVarFinalVal] = materializeValue(stat.deviceSubState.value, solver, cloneCache, opBuilder);
   }
 
   // If has a corresponding operation.
@@ -485,7 +500,7 @@ static Value materializeValue(
   return cloneCache[mapVarFinalVal];
 }
                                                                                                                             
-// FIXME: not always track back to alloca, maybe track back to address_of
+// TODO: not always track back to alloca, maybe track back to address_of
 static Value createLocalAlloca(
   Block& entryBlock,
   Value mapVar,
@@ -517,16 +532,12 @@ static Value createLocalAlloca(
                                                                                                                             
 static void assignToLocalAlloca(
   Value replacementMem,
-  Value mapVar,
+  Value mapVarVal,
   omp::TargetOp targetOp,
-  const MemoryAliasLattice& aliasLattice,
   DataFlowSolver& solver,
   OpBuilder& opBuilder,
   llvm::DenseMap<Value, Value>& cloneCache
 ) {
-  auto root = getRootMem(mapVar);
-  assert(aliasLattice.memoryMap.contains(root));
-  auto mapVarVal = aliasLattice.memoryMap.at(root).hostValue;
   if (mapVarVal != nullptr) {
     mapVarVal.printAsOperand(llvm::dbgs(), {});
     auto finalVal = materializeValue(mapVarVal, solver, cloneCache, opBuilder);
@@ -547,13 +558,13 @@ static void foldConstantPrivates(
   auto mapVarOffset = getBlockMapVarsOffset(targetOp);
   assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
   
-  llvm::DenseMap<Value, Foldability> foldabilityMap;
+  llvm::DenseMap<Value, std::pair<Foldability, Value>> foldabilityMap;
   for (int i = int(targetOp.numMapBlockArgs()) - 1; i >= 0; i--) {
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = checkFoldability(arg, mapVar, targetOp, solver, aliasLattice); 
-    foldabilityMap[mapVar] = foldability;
+    auto foldabilityRes = checkFoldability(arg, mapVar, targetOp, solver, aliasLattice); 
+    foldabilityMap[mapVar] = foldabilityRes;
   }
 
   OpBuilder::InsertionGuard guardAOTFold(opBuilder); 
@@ -562,14 +573,15 @@ static void foldConstantPrivates(
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = foldabilityMap[mapVar];
+    auto foldabilityRes = foldabilityMap[mapVar];
+    auto foldability = foldabilityRes.first;
     if (foldability == Foldability::Unfoldable) {
       continue;
     }
     if (foldability == Foldability::AOTTempFold || foldability == Foldability::AOTConstFold) {
         Value replacementMem = createLocalAlloca(entryBlock, mapVar, arg, opBuilder, targetOp);
       if (foldability == Foldability::AOTConstFold) {
-        assignToLocalAlloca(replacementMem, mapVar, targetOp, *aliasLattice, solver, opBuilder, cloneCache);
+        assignToLocalAlloca(replacementMem, foldabilityRes.second, targetOp, solver, opBuilder, cloneCache);
       }
       arg.replaceAllUsesWith(replacementMem);
       assert(entryBlock.getArgument(argIdx).getUses().empty());
@@ -584,7 +596,7 @@ static void foldConstantPrivates(
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = foldabilityMap[mapVar];
+    auto foldability = foldabilityMap[mapVar].first;
     if (foldability == Foldability::JITFold) {
       assert(arg.getNumUses() == 1); // should only have a declare operation
       for (auto* user : arg.getUsers()) {
@@ -641,7 +653,7 @@ static void foldConstantPrivates(
   llvm::SmallVector<Attribute> jitArgAttrs;
   for (const auto& mapVar: targetOp.getMapVars()) {
     assert(foldabilityMap.contains(mapVar));
-    if (foldabilityMap[mapVar] == Foldability::JITFold) {
+    if (foldabilityMap[mapVar].first == Foldability::JITFold) {
       auto strAttr = StringAttr::get(targetOp.getContext());      
       jitArgAttrs.push_back(strAttr);
     } else {
