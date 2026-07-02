@@ -30,10 +30,17 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
+#include <fcntl.h>
+#include <functional>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
 #include <mlir/Analysis/DataFlowFramework.h>
@@ -236,11 +243,60 @@ private:
   func::FuncOp currentFunc;
 
   // TODO: implement! 
-  void handleTargetOp(omp::TargetOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
-  void handleTargetDataOp(omp::TargetDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
-  void handleTargetUpdateOp(omp::TargetUpdateOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
-  void handleTargetEnterDataOp(omp::TargetEnterDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
-  void handleTargetExitDataOp(omp::TargetExitDataOp, const MemoryAliasLattice &before, MemoryAliasLattice *after) {};
+  //
+  // These 2 are blocks
+  void handleTargetOp(omp::TargetOp, MemoryAliasLattice *after) {};
+  void handleTargetDataOp(omp::TargetDataOp, MemoryAliasLattice *after) {};
+
+
+  void handleDataUpdate(
+    ::mlir::Operation::operand_range mapVars, 
+    MemoryAliasLattice* after,
+    llvm::function_ref<void(MemState&, ::mlir::omp::ClauseMapFlags)> updater
+  ) {
+    for (const auto& mapVar: mapVars) {
+      auto root = getRootMem(mapVar);
+      assert(after->memoryMap.contains(root));
+      auto& state = after->memoryMap.at(root);
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp()); 
+      assert(mapInfoOp);
+      auto direction = mapInfoOp.getMapType();
+      updater(state, direction);
+    }
+  } 
+
+  // These 3 are standalone operations
+  void handleTargetUpdateOp(omp::TargetUpdateOp op, MemoryAliasLattice *after) {
+    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      assert(!(hasFrom && hasTo));
+      if (hasFrom) {
+        // from device to host
+        state.hostSubState = state.deviceSubState;
+        // refCount no change
+      } else if (hasTo) {
+        // from host to device 
+        state.deviceSubState = state.hostSubState;
+        // refCount no change
+      } else {
+        llvm::errs() << "Unexpected target update direction: " << direction << "\n";
+        llvm_unreachable("Unexpected target update direction");
+      }
+      return;
+    });
+  };
+
+  void handleTargetEnterDataOp(omp::TargetEnterDataOp op, MemoryAliasLattice *after) {
+    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+      // bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::);
+      // bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      return;
+    });
+  };
+
+  void handleTargetExitDataOp(omp::TargetExitDataOp, MemoryAliasLattice *after) {};
 
 
 public:
@@ -258,11 +314,11 @@ public:
       return mlir::success();
     }
     llvm::TypeSwitch<Operation*>(op)
-        .Case([&](omp::TargetOp targetOp){handleTargetOp(targetOp, before, after);})
-        .Case([&](omp::TargetDataOp targetDataOp){handleTargetDataOp(targetDataOp, before, after);})
-        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, before, after);})
-        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, before, after);})
-        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, before, after);})
+        .Case([&](omp::TargetOp targetOp){handleTargetOp(targetOp, after);})
+        .Case([&](omp::TargetDataOp targetDataOp){handleTargetDataOp(targetDataOp, after);})
+        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, after);})
+        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, after);})
+        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, after);})
         .Case([&](fir::AllocaOp alloca){
           MemState s = {
             {SubState::State::Bottom, nullptr},
@@ -398,6 +454,12 @@ static std::pair<Foldability, Value> checkFoldability(
   mlir::DataFlowSolver& solver,
   const MemoryAliasLattice* aliasLattice
 ) {
+  // INFO: only fold temporary scalar should already serve our purpose.
+  Type eleTy = fir::unwrapRefType(arg.getType());
+  if (!eleTy.isIntOrIndexOrFloat()) {
+    return {Foldability::Unfoldable, nullptr};
+  }
+
   // INFO: if arg is never declared, we should not fold, as they are metainfo.
   auto declared = false;
   for (Operation* user: arg.getUsers()) {
@@ -486,8 +548,8 @@ static Value materializeValue(
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
-    //FIXME: this is not correct!!!!
-    cloneCache[mapVarFinalVal] = materializeValue(stat.deviceSubState.value, solver, cloneCache, opBuilder);
+    // FIXME: not sure if the first argument here should : stat.hostSubState.value
+    cloneCache[mapVarFinalVal] = materializeValue(stat.hostSubState.value, solver, cloneCache, opBuilder);
   }
 
   // If has a corresponding operation.
@@ -508,24 +570,15 @@ static Value createLocalAlloca(
   OpBuilder& opBuilder,
   omp::TargetOp targetOp
 ) {
-  auto oldAllocaOp = llvm::dyn_cast<fir::AllocaOp>(trackToAllocaOp(mapVar));
-  assert(oldAllocaOp);
+  Type argTy = arg.getType();
+  Type eleTy = fir::unwrapRefType(argTy);
   auto newAllocaOp = fir::AllocaOp::create(
-    opBuilder, 
-    targetOp.getLoc(), 
-    oldAllocaOp.getInType(), 
-    oldAllocaOp.getUniqName().has_value()? oldAllocaOp.getUniqName().value(): "",
-    oldAllocaOp.getBindcName().has_value()? oldAllocaOp.getBindcName().value(): "",
-    oldAllocaOp.getTypeparams(),
-    oldAllocaOp.getShape(),
-    oldAllocaOp->getAttrs()
-  );
-  mlir::Value replacementMem = newAllocaOp.getResult();
-  if (replacementMem.getType() != arg.getType()) {
+    opBuilder, targetOp.getLoc(), eleTy, "", "", ValueRange{}, {}, {});
+  Value replacementMem = newAllocaOp.getResult();
+  if (replacementMem.getType() != argTy) {
     replacementMem = fir::ConvertOp::create(opBuilder, targetOp.getLoc(), arg.getType(), replacementMem).getResult();
   }
-  mlir::Type valType = fir::unwrapRefType(replacementMem.getType());
-  auto zeroConstant = fir::ZeroOp::create(opBuilder, targetOp.getLoc(), valType);
+  auto zeroConstant = fir::ZeroOp::create(opBuilder, targetOp.getLoc(), eleTy);
   fir::StoreOp::create(opBuilder, targetOp.getLoc(), zeroConstant.getResult(), replacementMem);
   return replacementMem;
 }
@@ -1194,33 +1247,42 @@ public:
         llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
-        // llvm::dbgs() << "\nA2:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA2 End\n";
+        llvm::dbgs() << "\nA2:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA2 End\n";
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
-        // llvm::dbgs() << "\nA3:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3 End\n";
+        llvm::dbgs() << "\nA3:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3 End\n";
 
         PassManager pm(&context);
         pm.addPass(mlir::createCSEPass());
         pm.addPass(mlir::createCanonicalizerPass());
         if (failed(pm.run(moduleOp))) {
           llvm::errs() << "Fail to preprocess the moduleOp!\n";
-          // TODO: should have fallback processing!
-          std::exit(EXIT_FAILURE);
+          std::exit(EXIT_FAILURE); // TODO: fall back processsing
         };
 
         DataFlowSolver solver;
         auto funcOp = targetOp->getParentOfType<func::FuncOp>();
         assert(funcOp);
-        solver.load<dataflow::DeadCodeAnalysis>(); // TODO: this should be loaded, but I comment it out to check the error message
+        solver.load<dataflow::DeadCodeAnalysis>();
         solver.load<TargetFoldabilityAnalysis>(funcOp);
         if (mlir::failed(solver.initializeAndRun(funcOp))) {
           moduleOp.emitError("Dataflow analysis failed to coverage");
           return;
         }
 
-        // llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
+        llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
         foldConstantPrivates(targetOp, opBuilder, solver);
         llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
+
+        // INFO: Liveness analysis
+        PassManager pm2(&context);
+        pm2.addPass(mlir::createMem2Reg());
+        pm2.addPass(mlir::createCanonicalizerPass());
+        if (failed(pm.run(funcOp))) {
+          llvm::errs() << "Fail to preprocess the functionOp!\n";
+          std::exit(EXIT_FAILURE); // TODO: fall back processing
+        }
+        llvm::dbgs() << "\nA6:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA6 End\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
@@ -1235,7 +1297,7 @@ public:
             FunctionType::get(&context, targetOp.getRegion().begin()->getArgumentTypes(), {}));
         b.cloneRegionBefore(targetOp.getRegion(), f.getRegion(), f.getRegion().begin());
 
-        //TODO: set attribute to the function argument
+        //TODO: set attribute to the function argument, this probably not needed as JITFold has already been done!
         if (auto foldabilityArray = targetOp->getAttrOfType<ArrayAttr>("jit_foldability")) {
           assert(f.getNumArguments() == foldabilityArray.size());          
           for (uint i = 0; i < f.getNumArguments(); i++) {
