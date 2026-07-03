@@ -30,17 +30,11 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
-#include "llvm/Support/Casting.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
-#include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
-#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
-#include <functional>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
 #include <mlir/Analysis/DataFlowFramework.h>
@@ -112,6 +106,12 @@ struct SubState {
     return !(*this == rhs); 
   }
 
+  // Usecase example: `omp target exit data map(delete)`
+  void reset() {
+    this->state = State::Bottom;
+    this->value = nullptr;
+  }
+
   static SubState join(
     const SubState& lhs, 
     const SubState& rhs 
@@ -132,7 +132,7 @@ struct SubState {
 struct MemState {
   SubState hostSubState = {SubState::State::Bottom, nullptr};
   SubState deviceSubState = {SubState::State::Bottom, nullptr};
-  std::pair<unsigned, unsigned> refCountRange = {0, 0}; 
+  std::pair<int, int> refCountRange = {0, 0}; 
 
   bool operator==(const MemState &rhs) const {
     return (hostSubState == rhs.hostSubState)
@@ -245,7 +245,10 @@ private:
   // TODO: implement! 
   //
   // These 2 are blocks
-  void handleTargetOp(omp::TargetOp, MemoryAliasLattice *after) {};
+  void handleTargetOp(omp::TargetOp, MemoryAliasLattice *after) {
+    
+  };
+
   void handleTargetDataOp(omp::TargetDataOp, MemoryAliasLattice *after) {};
 
 
@@ -276,27 +279,138 @@ private:
         // from device to host
         state.hostSubState = state.deviceSubState;
         // refCount no change
-      } else if (hasTo) {
+        return;
+      }
+      if (hasTo) {
         // from host to device 
         state.deviceSubState = state.hostSubState;
         // refCount no change
-      } else {
-        llvm::errs() << "Unexpected target update direction: " << direction << "\n";
-        llvm_unreachable("Unexpected target update direction");
-      }
+        return;
+      } 
+      llvm_unreachable("Unexpected target update direction");
       return;
     });
   };
 
   void handleTargetEnterDataOp(omp::TargetEnterDataOp op, MemoryAliasLattice *after) {
     handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
-      // bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::);
-      // bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      // According to https://www.openmp.org/spec-html/5.0/openmpsu58.html: A map-type must be specified in all map clauses and must be either to or alloc.
+      // `alloc` will be come `storage` clause
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      // common clause flag
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(hasAlloc || hasTo);
+      assert(!(hasAlloc && hasTo));
+      if (hasAlloc) {
+        // 1. If not mapped (0, 0), alloc undefined
+        // 2. If mapped (Z+, Z+), keep the same
+        // 3. If (0, Z+), then JOIN(deviceValue, TOP) = TOP, the same with 1
+        if (state.refCountRange.first == 0) {
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // DO NOTHING
+        }
+        state.refCountRange.first += 1;
+        state.refCountRange.second+= 1;
+        return;
+      } 
+      if (hasTo) {
+        state.refCountRange.first += 1;
+        state.refCountRange.second+= 1;
+        if (hasAlways || state.refCountRange.second == 0) {
+          state.deviceSubState = state.hostSubState;
+          return;
+        } 
+        // {*, Z+}
+        if (state.refCountRange.first == 0) {
+          // {0, Z+}
+          state.deviceSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          return;
+        } 
+        // {Z+, Z+}
+        // DO NOTHING except for refCountRange increase
+      }
+      llvm_unreachable("Unexpected target update direction");
       return;
     });
   };
 
-  void handleTargetExitDataOp(omp::TargetExitDataOp, MemoryAliasLattice *after) {};
+  void handleTargetExitDataOp(omp::TargetExitDataOp op, MemoryAliasLattice *after) {
+    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+      //  A map-type must be specified in all map clauses and must be either from, release, or delete. (https://www.openmp.org/spec-html/5.0/openmpsu59.html)
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);  
+      bool hasRelease = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+      bool hasDelete = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::del);
+      assert((int)hasFrom + (int)hasRelease + (int)hasDelete == 1 && "target exit data map-type must be from, release, or delete");
+      // common flag
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        if (hasAlways) {
+          // (0, 0) do nothing
+          // (0, Z+) host = join(host, device) 
+          // (1, Z+) set host to device
+          if (state.refCountRange.first == 0) {
+            if (state.refCountRange.second >= 1) {
+              state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+            }
+          } else {
+            // (1, Z+)
+            state.hostSubState = state.deviceSubState;
+          }
+          state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
+          state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+          if (state.refCountRange.second == 0) {
+            state.deviceSubState.reset();
+          }
+          return;
+        }
+        if (state.refCountRange.first == 0) {
+          if (state.refCountRange.second == 0) {
+            // (0, 0), DO NOTHING
+          } else {
+            // (0, Z+):
+            // - if 0.. do nothing
+            // - if 1.. copy back and reset
+            // - if 1+.. do nothing
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+            // device state = join(BOT, device state) = device state
+          }
+        } else if (state.refCountRange.first == 1){
+          // - if 1: copy back and reset 
+          // - else: do nothing
+          if (state.refCountRange.second == 1) {
+            state.hostSubState = state.deviceSubState;
+          } else {
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          }
+          // device state = join(BOT, device state) = device state
+        } else {
+          // DO NOTHING
+        }
+        state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
+        state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasRelease) {
+        state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
+        state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasDelete) {
+        state.deviceSubState.reset();
+        state.refCountRange = {0, 0};
+        return;
+      }
+      llvm_unreachable("Unexpected target update direction");
+    });
+  }
 
 
 public:
@@ -513,25 +627,25 @@ static std::pair<Foldability, Value> checkFoldability(
   return {Foldability::AOTConstFold, joinedState.value};
 }
 
-static Operation* trackToAllocaOp(Value mem) {
-  auto* definedOp = mem.getDefiningOp();
-  if (auto allocaOp = llvm::dyn_cast<fir::AllocaOp>(definedOp)) {
-    return allocaOp;
-  }
-  if (auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
-    return trackToAllocaOp(declareOp.getMemref());
-  }
-  if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
-    return trackToAllocaOp(mapInfoOp.getVarPtr());
-  }
-  if (auto convertOp = llvm::dyn_cast<fir::ConvertOp>(definedOp)) {
-    return trackToAllocaOp(convertOp.getValue());
-  }
-  llvm::errs() << "\n Unexpected Define Op:";
-  definedOp -> print(llvm::errs());
-  llvm_unreachable("Unexpected define op");
-  return nullptr;
-}
+// static Operation* trackToAllocaOp(Value mem) {
+//   auto* definedOp = mem.getDefiningOp();
+//   if (auto allocaOp = llvm::dyn_cast<fir::AllocaOp>(definedOp)) {
+//     return allocaOp;
+//   }
+//   if (auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
+//     return trackToAllocaOp(declareOp.getMemref());
+//   }
+//   if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
+//     return trackToAllocaOp(mapInfoOp.getVarPtr());
+//   }
+//   if (auto convertOp = llvm::dyn_cast<fir::ConvertOp>(definedOp)) {
+//     return trackToAllocaOp(convertOp.getValue());
+//   }
+//   llvm::errs() << "\n Unexpected Define Op:";
+//   definedOp -> print(llvm::errs());
+//   llvm_unreachable("Unexpected define op");
+//   return nullptr;
+// }
 
 // Print the dataflow chain of val to the target location
 static Value materializeValue(
