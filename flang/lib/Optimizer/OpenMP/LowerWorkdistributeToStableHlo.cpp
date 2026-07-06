@@ -30,11 +30,17 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <algorithm>
+#include <cassert>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
+#include <mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
 #include <mlir/Analysis/DataFlowFramework.h>
@@ -43,6 +49,7 @@
 #include <mlir/Dialect/LLVMIR/LLVMTypes.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsAttributes.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Utils/IndexingUtils.h>
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/Block.h>
@@ -154,9 +161,35 @@ struct MemState {
     ms.refCountRange = {std::min(lhs.refCountRange.first, rhs.refCountRange.first), std::max(lhs.refCountRange.second, rhs.refCountRange.second)};
     return ms;
   }
+
+  int incRefCount(int count) {
+    if (count < INT_MAX) return count + 1;
+    return count;
+  } 
+
+  int decRefCount(int count) {
+    return std::max(int(0), count - 1);
+  }
+
+  void incRefCounts() {
+    this->refCountRange = {
+      incRefCount(this->refCountRange.first), 
+      incRefCount(this->refCountRange.second)
+    };
+    return;
+  }
+
+  void decRefCounts() {
+    this->refCountRange = {
+      decRefCount(this->refCountRange.first), 
+      decRefCount(this->refCountRange.second)
+    };
+    return;
+  }
 };
 
 // Instead of maintaing an alias set.
+// FIXME: consider the data mapping! for example, `map_entries(%val -> %arg)`, %arg should be able to trace to %val
 // TODO: think if slicing will also fit here.
 static Value getRootMem(Value mem) {
   Value curr = mem;
@@ -242,20 +275,10 @@ class TargetFoldabilityAnalysis: public mlir::dataflow::DenseForwardDataFlowAnal
 private:
   func::FuncOp currentFunc;
 
-  // TODO: implement! 
-  //
-  // These 2 are blocks
-  void handleTargetOp(omp::TargetOp, MemoryAliasLattice *after) {
-    
-  };
-
-  void handleTargetDataOp(omp::TargetDataOp, MemoryAliasLattice *after) {};
-
-
-  void handleDataUpdate(
+  void opDataUpdate(
     ::mlir::Operation::operand_range mapVars, 
     MemoryAliasLattice* after,
-    llvm::function_ref<void(MemState&, ::mlir::omp::ClauseMapFlags)> updater
+    llvm::function_ref<void(MemState&, ::mlir::omp::ClauseMapFlags, ::mlir::omp::VariableCaptureKind)> updater
   ) {
     for (const auto& mapVar: mapVars) {
       auto root = getRootMem(mapVar);
@@ -265,13 +288,14 @@ private:
       auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp()); 
       assert(mapInfoOp);
       auto direction = mapInfoOp.getMapType();
-      updater(state, direction);
+      auto captureType = mapInfoOp.getMapCaptureType();
+      updater(state, direction, captureType);
     }
   } 
 
   // These 3 are standalone operations
   void handleTargetUpdateOp(omp::TargetUpdateOp op, MemoryAliasLattice *after) {
-    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
       bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
       assert(!(hasFrom && hasTo));
@@ -293,7 +317,7 @@ private:
   };
 
   void handleTargetEnterDataOp(omp::TargetEnterDataOp op, MemoryAliasLattice *after) {
-    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       // According to https://www.openmp.org/spec-html/5.0/openmpsu58.html: A map-type must be specified in all map clauses and must be either to or alloc.
       // `alloc` will be come `storage` clause
       bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
@@ -311,13 +335,11 @@ private:
         } else {
           // DO NOTHING
         }
-        state.refCountRange.first += 1;
-        state.refCountRange.second+= 1;
+        state.incRefCounts();
         return;
       } 
       if (hasTo) {
-        state.refCountRange.first += 1;
-        state.refCountRange.second+= 1;
+        state.incRefCounts();
         if (hasAlways || state.refCountRange.second == 0) {
           state.deviceSubState = state.hostSubState;
           return;
@@ -330,6 +352,7 @@ private:
         } 
         // {Z+, Z+}
         // DO NOTHING except for refCountRange increase
+        return;
       }
       llvm_unreachable("Unexpected target update direction");
       return;
@@ -337,7 +360,7 @@ private:
   };
 
   void handleTargetExitDataOp(omp::TargetExitDataOp op, MemoryAliasLattice *after) {
-    handleDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction){
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       //  A map-type must be specified in all map clauses and must be either from, release, or delete. (https://www.openmp.org/spec-html/5.0/openmpsu59.html)
       bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);  
       bool hasRelease = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
@@ -358,8 +381,7 @@ private:
             // (1, Z+)
             state.hostSubState = state.deviceSubState;
           }
-          state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
-          state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+          state.decRefCounts();
           if (state.refCountRange.second == 0) {
             state.deviceSubState.reset();
           }
@@ -388,16 +410,14 @@ private:
         } else {
           // DO NOTHING
         }
-        state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
-        state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+        state.decRefCounts();
         if (state.refCountRange.second == 0) {
           state.deviceSubState.reset();
         }
         return;
       }
       if (hasRelease) {
-        state.refCountRange.first = std::max(int(0), state.refCountRange.first - 1);
-        state.refCountRange.second = std::max(int(0), state.refCountRange.second - 1);
+        state.decRefCounts();
         if (state.refCountRange.second == 0) {
           state.deviceSubState.reset();
         }
@@ -412,11 +432,87 @@ private:
     });
   }
 
+  void handleEnteringTargetOp(omp::TargetOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      if (captureType == omp::VariableCaptureKind::ByCopy) {
+        // If it is by copy, then it actually works like a first private. 
+        // I suppose device value should be regarded as the same as the host value.
+        state.deviceSubState = state.hostSubState;
+        state.refCountRange = {0, 0};
+        return;
+      }
+      // Following are ByRef 
+      assert(captureType == omp::VariableCaptureKind::ByCopy);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      // TODO: IMPLEMENT ME
+    });
+  }
+
+  void handleExitingTargetOp(omp::TargetOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      // TODO: IMPLEMENT ME
+    });
+  }
+
+  void handleEnteringTargetDataOp(omp::TargetDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      // TODO: IMPLEMENT ME
+    });
+  }
+
+  void handleExitingTargetDataOp(omp::TargetDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      // TODO: IMPLEMENT ME
+    });
+  }
 
 public:
   TargetFoldabilityAnalysis(DataFlowSolver& solver, func::FuncOp func):
     DenseForwardDataFlowAnalysis(solver), currentFunc(func) {};
 
+  void visitRegionBranchControlFlowTransfer(
+    RegionBranchOpInterface branch, 
+    std::optional<unsigned int> regionFrom, 
+    std::optional<unsigned int> regionTo, const 
+    MemoryAliasLattice &before, 
+    MemoryAliasLattice *after
+  ) override {
+    auto* op = branch.getOperation();
+    assert(op);
+    if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(op)) {
+      after->memoryMap = before.memoryMap;
+      // Entering:
+      // `regionFrom` is nullptr, means it is the parentOP. 
+      // `regionTo` is 0, means it is the first region of the Op.
+      // In summary, this means from the edge going from the parentOp to the region of the it.
+      if (!regionFrom && regionTo && *regionTo == 0) {
+        handleEnteringTargetOp(targetOp, after); 
+        return;
+      } 
+      if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleExitingTargetOp(targetOp, after);
+        return;
+      }
+      llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+    }
+    if (auto targetDataOp = llvm::dyn_cast<omp::TargetDataOp>(op)) {
+      if (!regionFrom && regionTo && *regionTo == 0) {
+        handleEnteringTargetDataOp(targetDataOp, after);
+        return;
+      }
+      if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleExitingTargetDataOp(targetDataOp, after);
+        return;
+      }
+      llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+    }
+    llvm::errs() << "\n[DEBUG] not catched: ";
+    op->print(llvm::errs());
+    llvm::errs() << "\n";
+    return;
+  }
+
+  // handle standalone operations
   LogicalResult visitOperation(
     mlir::Operation *op,
     const MemoryAliasLattice &before,
@@ -427,9 +523,23 @@ public:
       // Skip and do not print log
       return mlir::success();
     }
+    
+  //TODO: should not print
+    if (auto targetDataOp = dyn_cast<omp::TargetDataOp>(op)) {
+      llvm::errs() << "[DEBUG] saw omp.target_data in visitOperation\n";
+      llvm::errs() << "[DEBUG] isa RegionBranchOpInterface = "
+                  << isa<RegionBranchOpInterface>(op) << "\n";
+    }
+
+  //TODO: should not print
+    if (auto targetOp = dyn_cast<omp::TargetOp>(op)) {
+      llvm::errs() << "[DEBUG] saw omp.target in visitOperation\n";
+      llvm::errs() << "[DEBUG] isa RegionBranchOpInterface = "
+                  << isa<RegionBranchOpInterface>(op) << "\n";
+    }
+
+
     llvm::TypeSwitch<Operation*>(op)
-        .Case([&](omp::TargetOp targetOp){handleTargetOp(targetOp, after);})
-        .Case([&](omp::TargetDataOp targetDataOp){handleTargetDataOp(targetDataOp, after);})
         .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, after);})
         .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, after);})
         .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, after);})
@@ -455,7 +565,7 @@ public:
               after->memoryMap[info.getResult()] = {
                 {SubState::State::Top, nullptr},
                 {SubState::State::Top, nullptr},
-                {0, UINT32_MAX}
+                {0, INT_MAX}
               };
             }
           } 
@@ -472,7 +582,7 @@ public:
             after->memoryMap[rootMem] = {
               {SubState::State::Top, nullptr},
               {SubState::State::Top, nullptr},
-              {0, UINT32_MAX},
+              {0, INT_MAX},
            };
           }
         })
@@ -488,7 +598,7 @@ public:
             after->memoryMap[rootMem] = {
               {SubState::State::Top, nullptr},
               {SubState::State::Top, nullptr},
-              {0, UINT32_MAX},
+              {0, INT_MAX},
             };
           }
         })
@@ -514,7 +624,7 @@ public:
       lattice->memoryMap[arg] = {
         {SubState::State::Known, arg},
         {SubState::State::Top, nullptr},
-        {0, UINT32_MAX}
+        {0, INT_MAX}
       };
     }
   }
@@ -598,7 +708,7 @@ static std::pair<Foldability, Value> checkFoldability(
     mapVar.printAsOperand(llvm::dbgs(), {});
     llvm::dbgs() << ", with root: \n",
     root.printAsOperand(llvm::dbgs(), {});
-    valueState = {{SubState::State::Top, nullptr}, {SubState::State::Top, nullptr}, {0, UINT32_MAX}};
+    valueState = {{SubState::State::Top, nullptr}, {SubState::State::Top, nullptr}, {0, INT_MAX}};
   }
 
   SubState joinedState;
@@ -626,26 +736,6 @@ static std::pair<Foldability, Value> checkFoldability(
   }
   return {Foldability::AOTConstFold, joinedState.value};
 }
-
-// static Operation* trackToAllocaOp(Value mem) {
-//   auto* definedOp = mem.getDefiningOp();
-//   if (auto allocaOp = llvm::dyn_cast<fir::AllocaOp>(definedOp)) {
-//     return allocaOp;
-//   }
-//   if (auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
-//     return trackToAllocaOp(declareOp.getMemref());
-//   }
-//   if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
-//     return trackToAllocaOp(mapInfoOp.getVarPtr());
-//   }
-//   if (auto convertOp = llvm::dyn_cast<fir::ConvertOp>(definedOp)) {
-//     return trackToAllocaOp(convertOp.getValue());
-//   }
-//   llvm::errs() << "\n Unexpected Define Op:";
-//   definedOp -> print(llvm::errs());
-//   llvm_unreachable("Unexpected define op");
-//   return nullptr;
-// }
 
 // Print the dataflow chain of val to the target location
 static Value materializeValue(
@@ -1378,6 +1468,7 @@ public:
         auto funcOp = targetOp->getParentOfType<func::FuncOp>();
         assert(funcOp);
         solver.load<dataflow::DeadCodeAnalysis>();
+        solver.load<dataflow::SparseConstantPropagation>();
         solver.load<TargetFoldabilityAnalysis>(funcOp);
         if (mlir::failed(solver.initializeAndRun(funcOp))) {
           moduleOp.emitError("Dataflow analysis failed to coverage");

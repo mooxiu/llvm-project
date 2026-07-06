@@ -22,6 +22,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/FoldInterfaces.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -29,6 +30,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLForwardCompat.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -2337,6 +2339,17 @@ LogicalResult TargetDataOp::verify() {
   return verifyMapClause(*this, getMapVars());
 }
 
+// Adapted from fir.if implementation.
+void TargetDataOp::getSuccessorRegions(
+  mlir::RegionBranchPoint point, 
+  llvm::SmallVectorImpl<::mlir::RegionSuccessor>& regions) {
+  if (!point.isParent()) {
+    regions.push_back(mlir::RegionSuccessor::parent());
+    return;
+  }
+  regions.push_back(mlir::RegionSuccessor(&getRegion()));
+}
+
 //===----------------------------------------------------------------------===//
 // TargetEnterDataOp
 //===----------------------------------------------------------------------===//
@@ -2862,6 +2875,18 @@ TargetRegionFlags TargetOp::getKernelExecFlags(Operation *capturedOp) {
 
   return TargetRegionFlags::generic;
 }
+
+// Copy from `TargetDataOp::getSuccessorRegions`
+void TargetOp::getSuccessorRegions(
+  mlir::RegionBranchPoint point, 
+  llvm::SmallVectorImpl<::mlir::RegionSuccessor>& regions) {
+  if (!point.isParent()) {
+    regions.push_back(mlir::RegionSuccessor::parent());
+    return;
+  }
+  regions.push_back(mlir::RegionSuccessor(&getRegion()));
+}
+
 
 //===----------------------------------------------------------------------===//
 // ParallelOp
