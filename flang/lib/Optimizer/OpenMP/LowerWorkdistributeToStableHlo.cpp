@@ -189,7 +189,6 @@ struct MemState {
 };
 
 // Instead of maintaing an alias set.
-// FIXME: consider the data mapping! for example, `map_entries(%val -> %arg)`, %arg should be able to trace to %val
 // TODO: think if slicing will also fit here.
 static Value getRootMem(Value mem) {
   Value curr = mem;
@@ -910,7 +909,6 @@ static Value materializeValue(
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
-    // FIXME: not sure if the first argument here should : stat.hostSubState.value
     cloneCache[mapVarFinalVal] = materializeValue(stat.hostSubState.value, solver, cloneCache, opBuilder);
   }
 
