@@ -436,21 +436,100 @@ private:
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       if (captureType == omp::VariableCaptureKind::ByCopy) {
         // If it is by copy, then it actually works like a first private. 
-        // I suppose device value should be regarded as the same as the host value.
-        state.deviceSubState = state.hostSubState;
-        state.refCountRange = {0, 0};
         return;
       }
       // Following are ByRef 
-      assert(captureType == omp::VariableCaptureKind::ByCopy);
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
       bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
-      // TODO: IMPLEMENT ME
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(!(hasTo && hasAlloc));
+      if (hasTo) {
+        if (state.refCountRange.second == 0 || hasAlways) {
+          // (0, 0)
+          state.deviceSubState = state.hostSubState;
+        } else {
+          if (state.refCountRange.first == 0) {
+            // (0, Z+)
+            state.deviceSubState = SubState::join(state.deviceSubState, state.hostSubState);
+          } else {
+            // (Z+, Z+): DO NOTHING
+          }
+        }
+        state.incRefCounts();
+        return;
+      }
+      if (hasAlloc || (hasFrom && !hasTo)) {
+        if (state.refCountRange.first == 0) {
+          // (0, 0): device -> TOP
+          // (0, Z+): device -> join(device, TOP) = TOP
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // (Z+, Z+): do nothing
+        }
+        state.incRefCounts();
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
     });
+    auto offSet = getBlockMapVarsOffset(op);
+    for (int i = 0; i < op.numMapBlockArgs(); i++) {
+      auto argIdx = i + offSet; 
+      Value arg = op.getRegion().front().getArgument(argIdx);
+      auto mapVarRoot = getRootMem(op.getMapVars()[i]); 
+      assert(after->memoryMap.contains(mapVarRoot));
+      after->memoryMap[arg] = {
+        after->memoryMap[mapVarRoot].deviceSubState, 
+        {SubState::State::Top, nullptr}, 
+        {0, 0}
+      };
+    }
   }
 
   void handleExitingTargetOp(omp::TargetOp op, MemoryAliasLattice *after) {
+    auto offSet = getBlockMapVarsOffset(op);
+    for (int i = 0; i < op.numMapBlockArgs(); i++) {
+      auto argIdx = i + offSet; 
+      Value arg = op.getRegion().front().getArgument(argIdx);
+      auto mapVarRoot = getRootMem(op.getMapVars()[i]); 
+      assert(after->memoryMap.contains(mapVarRoot));
+      assert(after->memoryMap.contains(arg));
+      after->memoryMap[mapVarRoot].deviceSubState = after->memoryMap[arg].hostSubState;
+    }
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
-      // TODO: IMPLEMENT ME
+      if (captureType == omp::VariableCaptureKind::ByCopy) {
+        // If it is by copy, then it actually works like a first private. 
+        return;
+      }
+      // Following are ByRef 
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        // conditional copy back
+        assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
+        if (state.refCountRange.second == 1 || hasAlways) {
+          // (1, 1) or always: copy back
+          state.hostSubState = state.deviceSubState;
+        } else {
+          if (state.refCountRange.first == 1) {
+            // (1, 1+)
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          } else {
+            // (1+, 1+): do nothing
+          }
+        }
+        state.decRefCounts();
+      }
+      if (hasAlloc || (hasTo && !hasFrom)) {
+        state.decRefCounts(); 
+      }
+      llvm_unreachable("ignore other cases for prototyping");
     });
   }
 
