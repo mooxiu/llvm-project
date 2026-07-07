@@ -432,7 +432,7 @@ private:
     });
   }
 
-  void handleEnteringTargetOp(omp::TargetOp op, MemoryAliasLattice *after) {
+  void handleTargetOpEnteringEdge(omp::TargetOp op, MemoryAliasLattice *after) {
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       if (captureType == omp::VariableCaptureKind::ByCopy) {
         // If it is by copy, then it actually works like a first private. 
@@ -478,25 +478,43 @@ private:
     for (int i = 0; i < op.numMapBlockArgs(); i++) {
       auto argIdx = i + offSet; 
       Value arg = op.getRegion().front().getArgument(argIdx);
-      auto mapVarRoot = getRootMem(op.getMapVars()[i]); 
+      Value mapVar = op.getMapVars()[i];
+      auto mapVarRoot = getRootMem(mapVar); 
       assert(after->memoryMap.contains(mapVarRoot));
-      after->memoryMap[arg] = {
-        after->memoryMap[mapVarRoot].deviceSubState, 
-        {SubState::State::Top, nullptr}, 
-        {0, 0}
-      };
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
+      if (mapInfoOp.getMapCaptureType() == mlir::omp::VariableCaptureKind::ByCopy) {
+        after->memoryMap[arg] = {
+          after->memoryMap[mapVarRoot].hostSubState, 
+          {SubState::State::Bottom, nullptr},
+          {0, 0}
+        };
+      } else {
+        after->memoryMap[arg] = {
+          after->memoryMap[mapVarRoot].deviceSubState, 
+          {SubState::State::Bottom, nullptr},
+          {0, 0}
+        };
+      }
     }
   }
 
-  void handleExitingTargetOp(omp::TargetOp op, MemoryAliasLattice *after) {
+  void handleTargetOpExitingEdge(omp::TargetOp op, MemoryAliasLattice *after) {
     auto offSet = getBlockMapVarsOffset(op);
     for (int i = 0; i < op.numMapBlockArgs(); i++) {
       auto argIdx = i + offSet; 
       Value arg = op.getRegion().front().getArgument(argIdx);
-      auto mapVarRoot = getRootMem(op.getMapVars()[i]); 
+      Value mapVar = op.getMapVars()[i];
+      auto mapVarRoot = getRootMem(mapVar); 
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
       assert(after->memoryMap.contains(mapVarRoot));
       assert(after->memoryMap.contains(arg));
-      after->memoryMap[mapVarRoot].deviceSubState = after->memoryMap[arg].hostSubState;
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
+      if (mapInfoOp.getMapCaptureType() == mlir::omp::VariableCaptureKind::ByRef) {
+        after->memoryMap[mapVarRoot].deviceSubState = after->memoryMap[arg].hostSubState;
+      } else {
+        // DO NOTHING if ByCopy
+      }
     }
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
       if (captureType == omp::VariableCaptureKind::ByCopy) {
@@ -525,23 +543,99 @@ private:
           }
         }
         state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
       }
       if (hasAlloc || (hasTo && !hasFrom)) {
+        // DO NOTHING
         state.decRefCounts(); 
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
       }
       llvm_unreachable("ignore other cases for prototyping");
     });
   }
 
-  void handleEnteringTargetDataOp(omp::TargetDataOp op, MemoryAliasLattice *after) {
+  void handleTargetDataOpEnteringEdge(omp::TargetDataOp op, MemoryAliasLattice *after) {
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
-      // TODO: IMPLEMENT ME
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(!(hasTo && hasAlloc));
+      if (hasTo) {
+        if (state.refCountRange.second == 0 || hasAlways) {
+          // (0, 0)
+          state.deviceSubState = state.hostSubState;
+        } else {
+          if (state.refCountRange.first == 0) {
+            // (0, Z+)
+            state.deviceSubState = SubState::join(state.deviceSubState, state.hostSubState);
+          } else {
+            // (Z+, Z+): DO NOTHING
+          }
+        }
+        state.incRefCounts();
+        return;
+      }
+      if (hasAlloc || (hasFrom && !hasTo)) {
+        if (state.refCountRange.first == 0) {
+          // (0, 0): device -> TOP
+          // (0, Z+): device -> join(device, TOP) = TOP
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // (Z+, Z+): do nothing
+        }
+        state.incRefCounts();
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
     });
   }
 
-  void handleExitingTargetDataOp(omp::TargetDataOp op, MemoryAliasLattice *after) {
+  void handleTargetDataOpExitingEdge(omp::TargetDataOp op, MemoryAliasLattice *after) {
     opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
-      // TODO: IMPLEMENT ME
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        // conditional copy back
+        assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
+        if (state.refCountRange.second == 1 || hasAlways) {
+          // (1, 1) or always: copy back
+          state.hostSubState = state.deviceSubState;
+        } else {
+          if (state.refCountRange.first == 1) {
+            // (1, 1+)
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          } else {
+            // (1+, 1+): do nothing
+          }
+        }
+        state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasAlloc || (hasTo && !hasFrom)) {
+        // DO NOTHING
+        state.decRefCounts(); 
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
     });
   }
 
@@ -565,22 +659,22 @@ public:
       // `regionTo` is 0, means it is the first region of the Op.
       // In summary, this means from the edge going from the parentOp to the region of the it.
       if (!regionFrom && regionTo && *regionTo == 0) {
-        handleEnteringTargetOp(targetOp, after); 
+        handleTargetOpEnteringEdge(targetOp, after); 
         return;
       } 
       if (regionFrom && *regionFrom == 0 && !regionTo) {
-        handleExitingTargetOp(targetOp, after);
+        handleTargetOpExitingEdge(targetOp, after);
         return;
       }
       llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
     }
     if (auto targetDataOp = llvm::dyn_cast<omp::TargetDataOp>(op)) {
       if (!regionFrom && regionTo && *regionTo == 0) {
-        handleEnteringTargetDataOp(targetDataOp, after);
+        handleTargetDataOpEnteringEdge(targetDataOp, after);
         return;
       }
       if (regionFrom && *regionFrom == 0 && !regionTo) {
-        handleExitingTargetDataOp(targetDataOp, after);
+        handleTargetDataOpExitingEdge(targetDataOp, after);
         return;
       }
       llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
@@ -602,21 +696,6 @@ public:
       // Skip and do not print log
       return mlir::success();
     }
-    
-  //TODO: should not print
-    if (auto targetDataOp = dyn_cast<omp::TargetDataOp>(op)) {
-      llvm::errs() << "[DEBUG] saw omp.target_data in visitOperation\n";
-      llvm::errs() << "[DEBUG] isa RegionBranchOpInterface = "
-                  << isa<RegionBranchOpInterface>(op) << "\n";
-    }
-
-  //TODO: should not print
-    if (auto targetOp = dyn_cast<omp::TargetOp>(op)) {
-      llvm::errs() << "[DEBUG] saw omp.target in visitOperation\n";
-      llvm::errs() << "[DEBUG] isa RegionBranchOpInterface = "
-                  << isa<RegionBranchOpInterface>(op) << "\n";
-    }
-
 
     llvm::TypeSwitch<Operation*>(op)
         .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, after);})
