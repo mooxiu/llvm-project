@@ -20,6 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "flang/Frontend/TextDiagnosticPrinter.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
@@ -34,6 +35,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/FormatVariadic.h"
 #include <algorithm>
 #include <cassert>
 #include <climits>
@@ -71,6 +74,8 @@
 #include <mlir/Support/WalkResult.h>
 #include <mlir/Transforms/Passes.h>
 #include <optional>
+#include <string>
+#include <strstream>
 #include <utility>
 #include <variant>
 
@@ -130,6 +135,31 @@ struct SubState {
     if (lhs.value == rhs.value) return lhs;
     return {State::Top, nullptr};
   }
+
+  std::string toStr() const {
+    auto valueToString = [](mlir::Value value) -> std::string {
+      if (!value) return "NULL";
+      std::string str;
+      llvm::raw_string_ostream os(str);
+      value.printAsOperand(os, mlir::OpPrintingFlags{});
+      os.flush();
+      return str;
+    };
+
+    std::string stateStr;
+    std::string valueStr;
+    if (this->state == State::Bottom) {
+      stateStr = "BOT";
+      valueStr = "NULL";
+    } else if (this->state == State::Known) {
+      stateStr = "KNO";
+      valueStr = valueToString(this->value);
+    } else {
+      stateStr = "TOP"; 
+      valueStr = "NULL";
+    }
+    return llvm::formatv("({0}, {1})", stateStr, valueStr);
+  }
 };
 
 // Definition of state lattice.
@@ -186,17 +216,34 @@ struct MemState {
     };
     return;
   }
+
+  std::string toStr() const {
+    return llvm::formatv(
+      "({0}, {1}, ({2}, {3})}", 
+      this->hostSubState.toStr(), 
+      this->deviceSubState.toStr(), 
+      this->refCountRange.first,
+      this->refCountRange.second
+    );
+  }
 };
 
 // Instead of maintaing an alias set.
 // TODO: think if slicing will also fit here.
 static Value getRootMem(Value mem) {
+  llvm::dbgs() << "\nfinding root of: ";
   Value curr = mem;
   while (Operation* defOp = curr.getDefiningOp()) {
+    llvm::dbgs() << " ";
+    curr.printAsOperand(llvm::dbgs(), {});
     if (auto declare = llvm::dyn_cast<hlfir::DeclareOp>(defOp)){
       curr = declare.getMemref();
       continue;
     } 
+    if (auto declare = llvm::dyn_cast<fir::DeclareOp>(defOp)) { // INFO: in fact, should not exist here.
+      curr = declare.getMemref();
+      continue;
+    }
     if (auto convOp = llvm::dyn_cast<fir::ConvertOp>(defOp)) {
       curr = convOp.getValue();
       continue;
@@ -267,7 +314,14 @@ public:
     return changed? mlir::ChangeResult::Change : mlir::ChangeResult::NoChange;
   }
 
-  void print(llvm::raw_ostream &os) const override {};
+  void print(llvm::raw_ostream &os) const override {
+    os << "\n[DEBUG] Current MemoryMap: ";
+    for (const auto& entry: memoryMap) {
+      os << "\n (Mem: "; 
+      entry.getFirst().printAsOperand(os, {});
+      os << ", State: " << entry.getSecond().toStr() << ")";
+    }
+  };
 };
 
 class TargetFoldabilityAnalysis: public mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice> {
@@ -281,6 +335,10 @@ private:
   ) {
     for (const auto& mapVar: mapVars) {
       auto root = getRootMem(mapVar);
+      llvm::dbgs() << "\n the mapVar is: ";
+      mapVar.printAsOperand(llvm::dbgs(), {});
+      llvm::dbgs() << ", the root is: ";
+      root.printAsOperand(llvm::dbgs(), {});
       assert(after->memoryMap.contains(root));
       auto& state = after->memoryMap.at(root);
       assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
@@ -474,7 +532,7 @@ private:
       llvm_unreachable("ignore other cases for prototyping");
     });
     auto offSet = getBlockMapVarsOffset(op);
-    for (int i = 0; i < op.numMapBlockArgs(); i++) {
+    for (unsigned int i = 0; i < op.numMapBlockArgs(); i++) {
       auto argIdx = i + offSet; 
       Value arg = op.getRegion().front().getArgument(argIdx);
       Value mapVar = op.getMapVars()[i];
@@ -500,7 +558,7 @@ private:
 
   void handleTargetOpExitingEdge(omp::TargetOp op, MemoryAliasLattice *after) {
     auto offSet = getBlockMapVarsOffset(op);
-    for (int i = 0; i < op.numMapBlockArgs(); i++) {
+    for (unsigned int i = 0; i < op.numMapBlockArgs(); i++) {
       auto argIdx = i + offSet; 
       Value arg = op.getRegion().front().getArgument(argIdx);
       Value mapVar = op.getMapVars()[i];
@@ -678,9 +736,13 @@ public:
       }
       llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
     }
+
     llvm::errs() << "\n[DEBUG] not catched: ";
     op->print(llvm::errs());
     llvm::errs() << "\n";
+
+    mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice>
+      ::visitRegionBranchControlFlowTransfer(branch, regionFrom, regionTo, before, after);
     return;
   }
 
@@ -701,19 +763,21 @@ public:
         .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, after);})
         .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, after);})
         .Case([&](fir::AllocaOp alloca){
-          MemState s = {
+          after->memoryMap[alloca.getResult()] = {
             {SubState::State::Bottom, nullptr},
             {SubState::State::Bottom, nullptr},
             {0, 0}
           };
-          after->memoryMap[alloca.getResult()] = s;
         })
         .Case([&](omp::MapInfoOp info){
-          // If byCopy, the root of the result is the result itself.
+          llvm::dbgs() << "\n[DEBUG] Handle: ";
+          info.print(llvm::dbgs());
+          after->print(llvm::dbgs());
           if (info.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
             auto varPtrRoot = getRootMem(info.getVarPtr());
             if (after->memoryMap.contains(varPtrRoot)) {
-              after->memoryMap[info.getResult()] = after->memoryMap[varPtrRoot]; 
+              // If byCopy, the root of the result is the result itself.
+              after->memoryMap[info.getResult()] = after->memoryMap.at(varPtrRoot); 
             } else {
               llvm::dbgs() << "\n[DEBUG]Cannot find varPtrRoot in status: ";
               info.print(llvm::dbgs());
@@ -725,7 +789,10 @@ public:
                 {0, INT_MAX}
               };
             }
-          } 
+          } else {
+            assert(info.getMapCaptureType() == omp::VariableCaptureKind::ByRef);
+            // ByRef: mapInfoOp does not change the value of anything, thus do nothing.
+          }
         })
         .Case([&](fir::StoreOp storeOp){
           auto rootMem = getRootMem(storeOp.getMemref());
@@ -1620,6 +1687,8 @@ public:
           std::exit(EXIT_FAILURE); // TODO: fall back processsing
         };
 
+
+        llvm::dbgs() << "\nA3.5:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3.5 End\n";
         DataFlowSolver solver;
         auto funcOp = targetOp->getParentOfType<func::FuncOp>();
         assert(funcOp);
