@@ -709,6 +709,20 @@ public:
   ) override {
     auto* op = branch.getOperation();
     assert(op);
+
+    llvm::errs() << "\n[RB] " << op->getName() << " from=";
+    if (regionFrom)
+      llvm::errs() << *regionFrom;
+    else
+      llvm::errs() << "parent";
+
+    llvm::errs() << " to=";
+    if (regionTo)
+      llvm::errs() << *regionTo;
+    else
+      llvm::errs() << "parent";
+    llvm::errs() << "\n";
+
     if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(op)) {
       after->memoryMap = before.memoryMap;
       // Entering:
@@ -726,6 +740,7 @@ public:
       llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
     }
     if (auto targetDataOp = llvm::dyn_cast<omp::TargetDataOp>(op)) {
+      after->memoryMap = before.memoryMap;
       if (!regionFrom && regionTo && *regionTo == 0) {
         handleTargetDataOpEnteringEdge(targetDataOp, after);
         return;
@@ -736,10 +751,6 @@ public:
       }
       llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
     }
-
-    llvm::errs() << "\n[DEBUG] not catched: ";
-    op->print(llvm::errs());
-    llvm::errs() << "\n";
 
     mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice>
       ::visitRegionBranchControlFlowTransfer(branch, regionFrom, regionTo, before, after);
@@ -1205,7 +1216,7 @@ static std::optional<PrivateOmpOp> findInPrivateVars(Value val) {
       if (llvm::is_contained(parallelOp.getPrivateVars(), val)) {
         return parallelOp; 
       }
-    } else if (auto distributeOp = llvm::dyn_cast<omp::ParallelOp>(owner)) {
+    } else if (auto distributeOp = llvm::dyn_cast<omp::DistributeOp>(owner)) {
       if (llvm::is_contained(distributeOp.getPrivateVars(), val)) {
         return distributeOp; 
       }
@@ -1708,7 +1719,7 @@ public:
         PassManager pm2(&context);
         pm2.addPass(mlir::createMem2Reg());
         pm2.addPass(mlir::createCanonicalizerPass());
-        if (failed(pm.run(funcOp))) {
+        if (failed(pm2.run(funcOp))) {
           llvm::errs() << "Fail to preprocess the functionOp!\n";
           std::exit(EXIT_FAILURE); // TODO: fall back processing
         }
