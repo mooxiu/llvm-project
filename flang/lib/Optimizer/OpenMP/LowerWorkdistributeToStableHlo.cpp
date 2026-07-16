@@ -37,6 +37,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <climits>
@@ -723,33 +724,35 @@ public:
       llvm::errs() << "parent";
     llvm::errs() << "\n";
 
+
+    MemoryAliasLattice candidate(after->getAnchor());
+    candidate.memoryMap = before.memoryMap;
+
     if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(op)) {
-      after->memoryMap = before.memoryMap;
       // Entering:
       // `regionFrom` is nullptr, means it is the parentOP. 
       // `regionTo` is 0, means it is the first region of the Op.
       // In summary, this means from the edge going from the parentOp to the region of the it.
       if (!regionFrom && regionTo && *regionTo == 0) {
-        handleTargetOpEnteringEdge(targetOp, after); 
-        return;
-      } 
-      if (regionFrom && *regionFrom == 0 && !regionTo) {
-        handleTargetOpExitingEdge(targetOp, after);
-        return;
+        handleTargetOpEnteringEdge(targetOp, &candidate); 
+      } else if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleTargetOpExitingEdge(targetOp, &candidate);
+      } else {
+        llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
       }
-      llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+      propagateIfChanged(after, after->join(candidate));
+      return;
     }
     if (auto targetDataOp = llvm::dyn_cast<omp::TargetDataOp>(op)) {
-      after->memoryMap = before.memoryMap;
       if (!regionFrom && regionTo && *regionTo == 0) {
-        handleTargetDataOpEnteringEdge(targetDataOp, after);
-        return;
+        handleTargetDataOpEnteringEdge(targetDataOp, &candidate);
+      } else if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleTargetDataOpExitingEdge(targetDataOp, &candidate);
+      } else {
+        llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
       }
-      if (regionFrom && *regionFrom == 0 && !regionTo) {
-        handleTargetDataOpExitingEdge(targetDataOp, after);
-        return;
-      }
-      llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+      propagateIfChanged(after, after->join(candidate));
+      return;
     }
 
     mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice>
@@ -763,18 +766,22 @@ public:
     const MemoryAliasLattice &before,
     MemoryAliasLattice *after
   ) override { 
-    after->memoryMap = before.memoryMap;
+
+    MemoryAliasLattice candidate(after->getAnchor());
+    candidate.memoryMap = before.memoryMap;
+
     if (op->getDialect()->getNamespace() == "arith") {
       // Skip and do not print log
+      propagateIfChanged(after, after->join(candidate));
       return mlir::success();
     }
 
     llvm::TypeSwitch<Operation*>(op)
-        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, after);})
-        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, after);})
-        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, after);})
+        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, &candidate);})
+        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, &candidate);})
+        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, &candidate);})
         .Case([&](fir::AllocaOp alloca){
-          after->memoryMap[alloca.getResult()] = {
+          (&candidate)->memoryMap[alloca.getResult()] = {
             {SubState::State::Bottom, nullptr},
             {SubState::State::Bottom, nullptr},
             {0, 0}
@@ -783,18 +790,18 @@ public:
         .Case([&](omp::MapInfoOp info){
           llvm::dbgs() << "\n[DEBUG] Handle: ";
           info.print(llvm::dbgs());
-          after->print(llvm::dbgs());
+          (&candidate)->print(llvm::dbgs());
           if (info.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
             auto varPtrRoot = getRootMem(info.getVarPtr());
-            if (after->memoryMap.contains(varPtrRoot)) {
+            if ((&candidate)->memoryMap.contains(varPtrRoot)) {
               // If byCopy, the root of the result is the result itself.
-              after->memoryMap[info.getResult()] = after->memoryMap.at(varPtrRoot); 
+              (&candidate)->memoryMap[info.getResult()] = (&candidate)->memoryMap.at(varPtrRoot); 
             } else {
               llvm::dbgs() << "\n[DEBUG]Cannot find varPtrRoot in status: ";
               info.print(llvm::dbgs());
               llvm::dbgs() << ", root is: ";
               varPtrRoot.printAsOperand(llvm::dbgs(), {});
-              after->memoryMap[info.getResult()] = {
+              (&candidate)->memoryMap[info.getResult()] = {
                 {SubState::State::Top, nullptr},
                 {SubState::State::Top, nullptr},
                 {0, INT_MAX}
@@ -807,14 +814,14 @@ public:
         })
         .Case([&](fir::StoreOp storeOp){
           auto rootMem = getRootMem(storeOp.getMemref());
-          if (after->memoryMap.contains(rootMem)) {
-            after->memoryMap[rootMem].hostSubState = {SubState::State::Known, storeOp.getValue()};
+          if ((&candidate)->memoryMap.contains(rootMem)) {
+            (&candidate)->memoryMap[rootMem].hostSubState = {SubState::State::Known, storeOp.getValue()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of StoredOp: ";
             storeOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {
+            (&candidate)->memoryMap[rootMem] = {
               {SubState::State::Top, nullptr},
               {SubState::State::Top, nullptr},
               {0, INT_MAX},
@@ -823,21 +830,26 @@ public:
         })
         .Case([&](hlfir::AssignOp assignOp){
           auto rootMem = getRootMem(assignOp.getLhs());
-          if (after->memoryMap.contains(rootMem)) {
-            after->memoryMap[rootMem].hostSubState = {SubState::State::Known, assignOp.getRhs()};
+          if ((&candidate)->memoryMap.contains(rootMem)) {
+            (&candidate)->memoryMap[rootMem].hostSubState = {SubState::State::Known, assignOp.getRhs()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of assignOp: ";
             assignOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {
+            (&candidate)->memoryMap[rootMem] = {
               {SubState::State::Top, nullptr},
               {SubState::State::Top, nullptr},
               {0, INT_MAX},
             };
           }
         })
-        .Case<omp::TargetOp, omp::MapBoundsOp, func::ReturnOp,
+        .Case<omp::TargetOp, omp::TargetDataOp>([&](auto){
+          llvm::errs() << "[ERR] Should not appear here: ";
+          op->print(llvm::errs(), {});
+          llvm::errs() << "\n";
+        })
+        .Case<omp::MapBoundsOp, func::ReturnOp,
               hlfir::DeclareOp, fir::ConvertOp, fir::LoadOp,
               fir::DummyScopeOp, fir::ShiftOp, fir::AddrOfOp,
               fir::BoxDimsOp, fir::BoxAddrOp, fir::BoxOffsetOp, 
@@ -850,18 +862,22 @@ public:
           llvm::dbgs() << "\n";
         })
     ;
+    propagateIfChanged(after, after->join(candidate));
     return success();
   }
   void setToEntryState(MemoryAliasLattice *lattice) override {
-    lattice->memoryMap.clear();
+    MemoryAliasLattice entryState(lattice->getAnchor());
+    // This function is supposed to be only called when initialization. Unless we have external function calls.
+    assert(currentFunc && !currentFunc.empty());
     if (!currentFunc || currentFunc.empty()) return;
     for (auto arg: currentFunc.getArguments()) {
-      lattice->memoryMap[arg] = {
+      entryState.memoryMap[arg] = {
         {SubState::State::Known, arg},
         {SubState::State::Top, nullptr},
         {0, INT_MAX}
       };
     }
+    propagateIfChanged(lattice, lattice->join(entryState));
   }
 };
 
