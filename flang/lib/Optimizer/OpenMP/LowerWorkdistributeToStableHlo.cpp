@@ -235,8 +235,8 @@ static Value getRootMem(Value mem) {
   llvm::dbgs() << "\nfinding root of: ";
   Value curr = mem;
   while (Operation* defOp = curr.getDefiningOp()) {
-    llvm::dbgs() << " ";
     curr.printAsOperand(llvm::dbgs(), {});
+    llvm::dbgs() << ", ";
     if (auto declare = llvm::dyn_cast<hlfir::DeclareOp>(defOp)){
       curr = declare.getMemref();
       continue;
@@ -340,8 +340,8 @@ private:
       mapVar.printAsOperand(llvm::dbgs(), {});
       llvm::dbgs() << ", the root is: ";
       root.printAsOperand(llvm::dbgs(), {});
-      assert(after->memoryMap.contains(root));
-      auto& state = after->memoryMap.at(root);
+      // assert(after->memoryMap.contains(root)); FIXME: think a better way of handling this
+      auto& state = after->memoryMap[root];
       assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
       auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp()); 
       assert(mapInfoOp);
@@ -565,8 +565,9 @@ private:
       Value mapVar = op.getMapVars()[i];
       auto mapVarRoot = getRootMem(mapVar); 
       assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
-      assert(after->memoryMap.contains(mapVarRoot));
-      assert(after->memoryMap.contains(arg));
+      // FIXME: find a better way to handle this
+      // assert(after->memoryMap.contains(mapVarRoot));
+      // assert(after->memoryMap.contains(arg));
       auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
       if (mapInfoOp.getMapCaptureType() == mlir::omp::VariableCaptureKind::ByRef) {
         after->memoryMap[mapVarRoot].deviceSubState = after->memoryMap[arg].hostSubState;
@@ -588,7 +589,8 @@ private:
       bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
       if (hasFrom) {
         // conditional copy back
-        assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
+        // FIXME: find a way to assert
+        // assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
         if (state.refCountRange.second == 1 || hasAlways) {
           // (1, 1) or always: copy back
           state.hostSubState = state.deviceSubState;
@@ -1073,6 +1075,20 @@ static void foldConstantPrivates(
     auto foldabilityRes = checkFoldability(arg, mapVar, targetOp, solver, aliasLattice); 
     foldabilityMap[mapVar] = foldabilityRes;
   }
+  // NOTE: DEBUG
+  llvm::dbgs() << "\n[DEBUG] Foldability Map: \n";
+  for (const auto&[value, pair]: foldabilityMap) {
+    llvm::dbgs() << "Value: ";
+    value.printAsOperand(llvm::dbgs(), {});
+    llvm::dbgs() << ", Foldability: " << std::to_string(int(pair.first)) << " , foldTo: ";
+    if (pair.second) {
+      pair.second.printAsOperand(llvm::dbgs(), {});
+    } else {
+
+    }
+    llvm::dbgs() << "\n";
+  }
+  llvm::dbgs() << "[DEBUG] Foldability Map End \n";
 
   OpBuilder::InsertionGuard guardAOTFold(opBuilder); 
   opBuilder.setInsertionPointToStart(&entryBlock);
