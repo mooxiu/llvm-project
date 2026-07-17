@@ -20,6 +20,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "flang/Frontend/TextDiagnosticPrinter.h"
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
@@ -29,9 +30,21 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/DebugLog.h"
-#include <clang/Parse/Parser.h>
-#include <memory>
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cassert>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
+#include <fcntl.h>
+#include <mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h>
 #include <mlir/Analysis/DataFlow/DeadCodeAnalysis.h>
 #include <mlir/Analysis/DataFlow/DenseAnalysis.h>
 #include <mlir/Analysis/DataFlowFramework.h>
@@ -40,6 +53,7 @@
 #include <mlir/Dialect/LLVMIR/LLVMTypes.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsAttributes.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Utils/IndexingUtils.h>
 #include <mlir/IR/Attributes.h>
 #include <mlir/IR/Block.h>
@@ -61,6 +75,8 @@
 #include <mlir/Support/WalkResult.h>
 #include <mlir/Transforms/Passes.h>
 #include <optional>
+#include <string>
+#include <strstream>
 #include <utility>
 #include <variant>
 
@@ -86,439 +102,149 @@ static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
 }
 
 
-// TODO: this might not be necessary as we only what to know if it is defined by an alloca or not?
-// Originally I think I need to splice all the track to the definition, but actually I can just shadow this.
-static std::optional<llvm::SmallVector<Operation*>> getSortedDefinitionTrack(omp::TargetOp targetOp, const Value& candidate) {
-  llvm::SmallVector<Operation*> track;
-
-  auto subroutineFunc = targetOp->getParentOfType<func::FuncOp>();
-  auto curr = candidate;
-  auto* definedOp = curr.getDefiningOp();
-  track.push_back(definedOp);
-  auto shouldEnd = [&](Operation* definedOp) -> bool {
-    if (!definedOp) return true; // also include the case when val is in block
-    return llvm::isa<fir::AllocaOp>(definedOp) || !subroutineFunc->isAncestor(definedOp);
-  };
-
-  while (!shouldEnd(definedOp)) {
-    if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
-      curr = mapInfoOp.getVarPtr();
-      definedOp = curr.getDefiningOp(); 
-      track.push_back(definedOp);
-      continue;
-    } 
-    if (auto viewOp = llvm::dyn_cast<mlir::ViewLikeOpInterface>(definedOp)) {
-      curr = viewOp.getViewSource();
-      definedOp = curr.getDefiningOp();
-      track.push_back(definedOp);
-      continue;
-    }
-    if (auto hlfirDeclareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
-      curr = hlfirDeclareOp.getMemref();
-      definedOp = curr.getDefiningOp();
-      track.push_back(definedOp);
-      continue;
-    }
-    // unexepected situation, should 
-    llvm::dbgs() << "Unexpected Situation: ";
-    definedOp->print(llvm::dbgs());
-    llvm::dbgs() << "\n";
-    track.push_back(nullptr);
-    break;
-  }
-  if (!track[track.size() - 1]) {return std::nullopt;}
-  std::reverse(track.begin(), track.end());
-  return track;
-}
-
-struct AliasVar {
-  llvm::DenseSet<Value> aliasSet;
-  Value currentValue;
-};
-
-struct ScanResult {
-  llvm::SmallVector<std::unique_ptr<AliasVar>> aliasVarStorage;
-  llvm::DenseMap<Value, AliasVar*> memToAliasVar;
-  llvm::DenseMap<Value, std::pair<Value, Operation*>> dataDAG;
-
-  // e.g. mem = fir.alloca
-  void newMem(Value mem) {
-    assert(!memToAliasVar.contains(mem));
-    auto aliasVar = std::make_unique<AliasVar>();
-    aliasVar->aliasSet.insert(mem);
-    aliasVar->currentValue = nullptr;
-
-    memToAliasVar[mem] = aliasVar.get();
-    aliasVarStorage.push_back(std::move(aliasVar));
-    return;
-  }
-
-  // e.g. fir.store val to mem, hlfir.assign val to mem
-  void assignValueToMem(Value mem, Value val) {
-    if (!memToAliasVar.contains(mem)) {
-      newMem(mem);
-    }
-    assert(memToAliasVar.contains(mem));
-    memToAliasVar[mem]->currentValue = val;
-    return;
-  };
-
-  // e.g. newMem = hlfir.declare(oldMem)
-  // e.g. memCopiedTo = map.info var_ptr(memCopiedFrom) map_clauses(implicit ToFrom) capture(ByRef)
-  void bindMems(Value oldMem, Value newMem) {
-    assert(memToAliasVar.contains(oldMem));
-    auto* aV = memToAliasVar[oldMem];
-    aV->aliasSet.insert(newMem);
-    memToAliasVar[newMem] = aV;
-    return;
-  }
-
-  // e.g. memCopiedTo = map.info var_ptr(memCopiedFrom) map_clauses(implicit) capture(ByCopy)
-  void copyMem(Value memCopiedFrom, Value memCopiedTo) {
-    newMem(memCopiedTo);
-    assert(memToAliasVar.contains(memCopiedTo));
-    assert(memToAliasVar.contains(memCopiedFrom));
-    memToAliasVar[memCopiedTo]->currentValue = memToAliasVar[memCopiedFrom]->currentValue;
-    return;
-  }
-
-  void loadValue(Value val, Value memLoadFrom) {
-    assert(memToAliasVar.contains(memLoadFrom));
-    assert(!dataDAG.contains(val));
-    dataDAG[val] = std::make_pair(memToAliasVar[memLoadFrom]->currentValue, nullptr); 
-    return;
-  }
-
-  void flowValue(Value val, Operation* op) {
-    assert(!dataDAG.contains(val));
-    dataDAG[val] = std::make_pair(nullptr, op);
-    return;
-  }
-};
-
-// TODO: this might be easier to achieve through MLIR's dataflow analysis framework... 
-[[deprecated("Use framework")]]
-static std::optional<ScanResult> scanValuesUntilTarget(omp::TargetOp targetOp) {
-  auto funcOp = targetOp->getParentOfType<func::FuncOp>();
-  llvm::SmallVector<Operation*> scanRoute;
-  scanRoute.push_back(targetOp);
-  auto* currBlock = targetOp->getBlock();
-  while (currBlock->getParentOp() != funcOp) {
-    auto* parentOp = currBlock->getParentOp();
-    // INFO: target might be under if condition
-    if (auto ifOp = llvm::dyn_cast<fir::IfOp>(parentOp)) {
-      scanRoute.push_back(ifOp);
-      currBlock = ifOp->getBlock();
-    } else {
-      llvm::dbgs() << "\nCannot scan due to unsupported parentOp:\n";
-      parentOp->print(llvm::dbgs(), {}); 
-      return std::nullopt;
-    }
-  }
-  std::reverse(scanRoute.begin(), scanRoute.end());
-
-  ScanResult res;
-  auto& entryBlock = funcOp.getRegion().front();
-  for (auto arg : entryBlock.getArguments()) {
-    res.assignValueToMem(arg, arg);
-  }
-
-  auto scanUntil = [&](Operation* stopOp) -> bool {
-    Operation& op = stopOp->getBlock()->getOperations().front();
-    Operation* opPtr = &op;
-    while (opPtr != stopOp) {
-      // TODO: consider the case when we have multiple targetOp, we should be able to skip the previous one!
-      if (opPtr->getNumRegions() > 0) {
-        llvm::errs() << "\nUnexpected Operation!\n";
-        opPtr->print(llvm::errs(), {}); 
-        auto lineColLoc = llvm::dyn_cast<FileLineColLoc>(targetOp.getLoc());
-        if (lineColLoc) {
-          llvm::errs() << "\n File name:" << lineColLoc.getFilename().getValue();
-        }
-        llvm::errs() << "\n";
-        return false;
-      }
-      llvm::TypeSwitch<Operation*>(opPtr)
-        .Case([&](fir::AllocaOp allocaOp){res.newMem(allocaOp.getResult());})
-        .Case([&](fir::StoreOp storeOp){res.assignValueToMem(storeOp.getMemref(), storeOp.getValue());})
-        .Case([&](hlfir::AssignOp assignOp){res.assignValueToMem(assignOp.getLhs(), assignOp.getRhs());})
-        // TODO: need to check the case of slice!
-        .Case([&](hlfir::DeclareOp declareOp){
-          assert(declareOp.getNumResults() == 2);
-          res.bindMems(declareOp.getMemref(), declareOp.getResult(0));
-          res.bindMems(declareOp.getMemref(), declareOp.getResult(1));
-        })
-        .Case([&](fir::ConvertOp convertOp){
-          // TODO: check this
-          if (llvm::isa<fir::ReferenceType>(convertOp.getResult().getType())) {
-            res.bindMems(convertOp.getOperand(), convertOp.getResult());
-          } else {
-            res.flowValue(convertOp.getResult(), convertOp);
-          }
-        })
-        .Case([&](fir::LoadOp loadOp){res.loadValue(loadOp.getResult(), loadOp.getMemref());})
-        .Case([&](fir::AddrOfOp addrOp){res.newMem(addrOp.getResult());}) // TODO: in fact I should just ignore this, but I also need to trim the whole chain
-        // %303 = omp.map.info var_ptr(%4#1 : !fir.ref<i32>, i32) map_clauses(implicit) capture(ByCopy) -> !fir.ref<i32> {name = "i"}
-        .Case([&](omp::MapInfoOp mapInfoOp){
-          if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
-            res.copyMem(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-          } else if (mapInfoOp.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
-            res.bindMems(mapInfoOp.getVarPtr(), mapInfoOp.getResult());
-          } else {
-            llvm::errs() << "Unexpected operation!";
-            mapInfoOp->print(llvm::errs());
-            llvm::errs() << "\n";
-            std::exit(EXIT_FAILURE);
-          }
-        })
-        .Default([&](auto){
-          // arith, math, complex
-          if (mlir::isPure(opPtr) && opPtr->getNumResults() == 1) {
-            res.flowValue(opPtr->getResult(0), opPtr);
-          } else {
-            llvm::dbgs() << "Skipped operation:";
-            opPtr->print(llvm::dbgs());
-            llvm::dbgs() << "\n";
-          }
-        })
-      ;
-      opPtr = opPtr->getNextNode();
-    }
-    return true;
-  };
-  for (auto* op: scanRoute) {
-    if (!scanUntil(op)) return std::move(res);
-  }
-  return std::move(res);
-}
-
-[[deprecated("use framework instead")]]
-static bool dependOnArg(
-  const Value& val,
-  const llvm::DenseMap<Value, std::pair<Value, Operation*>>& dataDAG,
-  const llvm::DenseSet<Value>& argsSet
-) {
-  if (argsSet.contains(val)) return true;
-  assert(dataDAG.contains(val)); 
-  auto pair = dataDAG.at(val);
-  assert(!(pair.first && pair.second));
-  if (pair.first) {
-    return dependOnArg(pair.first, dataDAG, argsSet);
-  } 
-  assert(pair.second);
-  return llvm::any_of(pair.second->getOperands(), [&](const auto& operand) -> bool{return dependOnArg(operand, dataDAG, argsSet);});
-}
-
-// There are 3 possible situations for private and first private variables.
-// (1) Private locally allocated purely for storing temporary variables.
-// (2) First Private assigned with constant value before target region.
-// (3) First Private assigned depend on input arguments (runtime constants though).
-// Fold (1), (2); But not (3).
-[[deprecated("use framework")]]
-static bool shouldFold(
-  const Value& candidate,
-  const ScanResult& sr, 
-  func::FuncOp funcOp,
-  const llvm::SmallVector<Operation*> &definitionTrack,
-  const llvm::DenseSet<Value>& argsSet
-) {
-  auto* declaredOp = definitionTrack.empty() ? nullptr : definitionTrack.back();
-  auto isTargetOrPointer = [](Operation* definedOp) {
-    return false; // TODO: finish this method.
-  };
-  if (!declaredOp || !funcOp->isAncestor(declaredOp) || isTargetOrPointer(declaredOp)) {
-    return false;
-  }
-
-  bool hasDeclared = false; // This is to avoid folding shape metas.
-  bool isLocallyAllocated = false;
-  for (auto* op: definitionTrack) {
-    if (llvm::isa<hlfir::DeclareOp>(op)) {
-      hasDeclared = true;
-    } else if (llvm::isa<fir::AllocaOp>(op)) {
-      isLocallyAllocated = true;
-    }
-    if (hasDeclared && isLocallyAllocated) break;
-  }
-  if (!(hasDeclared && isLocallyAllocated)) return false;
-
-  if (!sr.memToAliasVar.contains(candidate)) {
-    // likely there are some unexpected operations block the analysis, so we cannot fold it, conservatively, suppose we can not fold the candidate.
-    return false;
-  }
-  auto* aV = sr.memToAliasVar.at(candidate);
-  if (aV->currentValue == nullptr) return true; // This belongs to case (1).
-  return !dependOnArg(aV->currentValue, sr.dataDAG, argsSet);
-}
-
-// Print the dataflow chain of val to the target location
-static Value materializeValue(
-  Value val, 
-  const llvm::DenseMap<Value, std::pair<Value, Operation*>>& dataDAG,
-  llvm::DenseMap<Value, Value>& cloneCache,
-  OpBuilder& opBuilder
-) {
-  assert(dataDAG.contains(val));
-  if (cloneCache.contains(val)) {
-    return cloneCache[val];
-  }
-  auto [upVal, defOp] = dataDAG.at(val);
-
-  // If only there is a value, transformed from a load operation.
-  assert(!(upVal && defOp));
-  assert(upVal || defOp);
-  if (upVal) {
-    auto result = materializeValue(upVal, dataDAG, cloneCache, opBuilder);
-    cloneCache[val] = result;
-    return result;
-  }
-
-  // If has a corresponding operation.
-  IRMapping vMap;
-  for (auto operand: defOp->getOperands()) {
-    vMap.map(operand, materializeValue(operand, dataDAG, cloneCache, opBuilder));
-  }
-  auto* newOp = opBuilder.clone(*defOp, vMap);
-  cloneCache[val] = newOp->getResult(0);
-  return cloneCache[val];
-}
-
-static Value createLocalAlloca(
-  const llvm::SmallVector<Operation*>& definitionTrack,
-  Block& entryBlock,
-  Value arg,
-  OpBuilder& opBuilder,
-  omp::TargetOp targetOp
-) {
-  auto oldAllocaOp = llvm::dyn_cast<fir::AllocaOp>(definitionTrack.front());
-  assert(oldAllocaOp);
-  
-  auto newAllocaOp = fir::AllocaOp::create(
-    opBuilder, 
-    targetOp.getLoc(), 
-    oldAllocaOp.getInType(), 
-    oldAllocaOp.getUniqName().has_value()? oldAllocaOp.getUniqName().value(): "",
-    oldAllocaOp.getBindcName().has_value()? oldAllocaOp.getBindcName().value(): "",
-    oldAllocaOp.getTypeparams(),
-    oldAllocaOp.getShape(),
-    oldAllocaOp->getAttrs()
-  );
-
-  mlir::Value replacementVal = newAllocaOp.getResult();
-  if (replacementVal.getType() != arg.getType()) {
-    replacementVal = fir::ConvertOp::create(opBuilder, targetOp.getLoc(), arg.getType(), replacementVal).getResult();
-  }
-  return replacementVal;
-}
-
-static void assignToLocalAlloca(
-  Value replacementVal,
-  omp::TargetOp targetOp,
-  int mapVarIdx,
-  const ScanResult& scanResult,
-  OpBuilder& opBuilder,
-  llvm::DenseMap<Value, Value>& cloneCache
-) {
-  auto mapVar = targetOp.getMapVars()[mapVarIdx];
-  assert(scanResult.memToAliasVar.contains(mapVar));
-  llvm::dbgs() << "Materialize the value for mapVar with index " << mapVarIdx << ", var: ";
-  mapVar.printAsOperand(llvm::dbgs(), {});
-  llvm::dbgs() << " , mapVarVal: ";
-  auto mapVarVal = scanResult.memToAliasVar.at(mapVar)->currentValue;
-  if (mapVarVal != nullptr) {
-    mapVarVal.printAsOperand(llvm::dbgs(), {});
-    auto finalVal = materializeValue(mapVarVal, scanResult.dataDAG, cloneCache, opBuilder);
-    hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), finalVal, replacementVal);
-  } else {
-    auto zeroConstant = arith::getZeroConstant(opBuilder, targetOp.getLoc(), fir::unwrapRefType(replacementVal.getType()));
-    hlfir::AssignOp::create(opBuilder, targetOp.getLoc(), zeroConstant, replacementVal);
-  }
-  llvm::dbgs() << " .\n";
-}
-
-[[deprecated("use framework instead")]]
-static void handleTemporaryVariables(omp::TargetOp targetOp, OpBuilder& opBuilder) {
-  auto funcOp = targetOp->getParentOfType<func::FuncOp>();
-  auto& entryBlock = targetOp.getRegion().front(); 
-  auto funcArgs = funcOp.getRegion().front().getArguments(); 
-  auto funcArgsSet = llvm::DenseSet<Value>(funcArgs.begin(), funcArgs.end());
-  auto scanResultOpt = scanValuesUntilTarget(targetOp);
-  if (!scanResultOpt.has_value()) return;
-  auto& scanResult = scanResultOpt.value();
-
-  auto mapVarOffset = getBlockMapVarsOffset(targetOp);
-  assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
-
-  OpBuilder::InsertionGuard guard(opBuilder); 
-  opBuilder.setInsertionPointToStart(&entryBlock);
-  llvm::SmallVector<int> indicesToFold;
-  llvm::DenseMap<Value, Value> cloneCache;
-  for (int i = targetOp.getMapVars().size() - 1; i >= 0; i--) {
-    auto candidate = targetOp.getMapVars()[i];
-    auto definitionTrackOpt = getSortedDefinitionTrack(targetOp, candidate);
-    if (!definitionTrackOpt.has_value()) continue;
-    auto definitionTrack = definitionTrackOpt.value();
-    if (!shouldFold(candidate, scanResult, funcOp, definitionTrack, funcArgsSet)) continue;
-    assert(llvm::isa<fir::AllocaOp>(definitionTrack.front()));
-
-    indicesToFold.push_back(i);
-    auto argIdx = mapVarOffset + i; 
-    auto arg = entryBlock.getArgument(argIdx);
-    auto replacementVal = createLocalAlloca(definitionTrack, entryBlock, arg, opBuilder, targetOp);
-    assignToLocalAlloca(replacementVal, targetOp, i, scanResult, opBuilder, cloneCache);
-    arg.replaceAllUsesWith(replacementVal);
-    assert(arg.getUses().empty());
-    
-    // Clear the arguments
-    assert(entryBlock.getArgument(argIdx).getUses().empty());
-    entryBlock.eraseArgument(argIdx);
-    targetOp.getMapVarsMutable().erase(i);
-  }
-  return;
-}
-
-// Definition of state lattice.
-// Bottom: Minimum uncertainty, unitialized, unreacheable, etc..
-// Known: Known value.
-// Top: Maximum uncertainty, unknown, for example, the join state of a value after assigned in an if block.
-struct MemoryValueState {
+struct SubState {
   enum class State {Bottom, Known, Top};
-
   State state = State::Bottom;
-  Value storedValue = nullptr;
+  Value value = nullptr;
 
-  bool operator==(const MemoryValueState &rhs) const {
+  bool operator==(const SubState &rhs) const {
     if (state != rhs.state) return false;
-    if (state == State::Known) return storedValue == rhs.storedValue;
+    if (state == State::Known) {
+      return value == rhs.value;
+    }
     return true;
   }
 
-  bool operator!=(const MemoryValueState &rhs) const {
-    return !(*this == rhs);
+  bool operator!=(const SubState &rhs) const {
+    return !(*this == rhs); 
   }
 
-  static MemoryValueState join(
-    const MemoryValueState& lhs, 
-    const MemoryValueState& rhs 
+  // Usecase example: `omp target exit data map(delete)`
+  void reset() {
+    this->state = State::Bottom;
+    this->value = nullptr;
+  }
+
+  static SubState join(
+    const SubState& lhs, 
+    const SubState& rhs 
   ) {
     if (lhs.state == State::Top || rhs.state == State::Top) return {State::Top, nullptr};
     if (lhs.state == State::Bottom) return rhs;
     if (rhs.state == State::Bottom) return lhs;
     assert(lhs.state == State::Known && rhs.state == State::Known);
-    if (lhs.storedValue == rhs.storedValue) return lhs;
+    if (lhs.value == rhs.value) return lhs;
     return {State::Top, nullptr};
+  }
+
+  std::string toStr() const {
+    auto valueToString = [](mlir::Value value) -> std::string {
+      if (!value) return "NULL";
+      std::string str;
+      llvm::raw_string_ostream os(str);
+      value.printAsOperand(os, mlir::OpPrintingFlags{});
+      os.flush();
+      return str;
+    };
+
+    std::string stateStr;
+    std::string valueStr;
+    if (this->state == State::Bottom) {
+      stateStr = "BOT";
+      valueStr = "NULL";
+    } else if (this->state == State::Known) {
+      stateStr = "KNO";
+      valueStr = valueToString(this->value);
+    } else {
+      stateStr = "TOP"; 
+      valueStr = "NULL";
+    }
+    return llvm::formatv("({0}, {1})", stateStr, valueStr);
+  }
+};
+
+// Definition of state lattice.
+// Bottom: Minimum uncertainty, unitialized, unreacheable, etc..
+// Known: Known value.
+// Top: Maximum uncertainty, unknown, for example, the join state of a value after assigned in an if block.
+struct MemState {
+  SubState hostSubState = {SubState::State::Bottom, nullptr};
+  SubState deviceSubState = {SubState::State::Bottom, nullptr};
+  std::pair<int, int> refCountRange = {0, 0}; 
+
+  bool operator==(const MemState &rhs) const {
+    return (hostSubState == rhs.hostSubState)
+      && (deviceSubState == rhs.deviceSubState)
+      && (refCountRange == rhs.refCountRange);
+  }
+
+  bool operator!=(const MemState &rhs) const {
+    return !(*this == rhs);
+  }
+
+  static MemState join(
+    const MemState& lhs, 
+    const MemState& rhs 
+  ) {
+    MemState ms;
+    ms.hostSubState = SubState::join(lhs.hostSubState, rhs.hostSubState);
+    ms.deviceSubState = SubState::join(lhs.deviceSubState, rhs.deviceSubState);
+    ms.refCountRange = {std::min(lhs.refCountRange.first, rhs.refCountRange.first), std::max(lhs.refCountRange.second, rhs.refCountRange.second)};
+    return ms;
+  }
+
+  int incRefCount(int count) {
+    if (count < INT_MAX) return count + 1;
+    return count;
+  } 
+
+  int decRefCount(int count) {
+    return std::max(int(0), count - 1);
+  }
+
+  void incRefCounts() {
+    this->refCountRange = {
+      incRefCount(this->refCountRange.first), 
+      incRefCount(this->refCountRange.second)
+    };
+    return;
+  }
+
+  void decRefCounts() {
+    this->refCountRange = {
+      decRefCount(this->refCountRange.first), 
+      decRefCount(this->refCountRange.second)
+    };
+    return;
+  }
+
+  std::string toStr() const {
+    return llvm::formatv(
+      "({0}, {1}, ({2}, {3})}", 
+      this->hostSubState.toStr(), 
+      this->deviceSubState.toStr(), 
+      this->refCountRange.first,
+      this->refCountRange.second
+    );
   }
 };
 
 // Instead of maintaing an alias set.
 // TODO: think if slicing will also fit here.
 static Value getRootMem(Value mem) {
+  llvm::dbgs() << "\nfinding root of: ";
   Value curr = mem;
   while (Operation* defOp = curr.getDefiningOp()) {
+    curr.printAsOperand(llvm::dbgs(), {});
+    llvm::dbgs() << ", ";
     if (auto declare = llvm::dyn_cast<hlfir::DeclareOp>(defOp)){
       curr = declare.getMemref();
       continue;
     } 
+    if (auto declare = llvm::dyn_cast<fir::DeclareOp>(defOp)) { // INFO: in fact, should not exist here.
+      curr = declare.getMemref();
+      continue;
+    }
     if (auto convOp = llvm::dyn_cast<fir::ConvertOp>(defOp)) {
       curr = convOp.getValue();
       continue;
@@ -572,7 +298,7 @@ public:
   using dataflow::AbstractDenseLattice::AbstractDenseLattice;
 
   // Only record the root memory's MemoryValueState, so we need to use getRootMem function to get the root first.
-  llvm::DenseMap<Value, MemoryValueState> memoryMap;
+  llvm::DenseMap<Value, MemState> memoryMap;
 
   ChangeResult join(const mlir::dataflow::AbstractDenseLattice &rhs) override {
     auto changed = false; 
@@ -582,109 +308,550 @@ public:
       if (!memoryMap.contains(mem)) changed = true;
       auto lhsState = memoryMap[mem]; // auto create bottom if not exist 
       auto rhsState = rhsLattice.memoryMap.at(mem);
-      auto joinState = MemoryValueState::join(lhsState, rhsState);
+      auto joinState = MemState::join(lhsState, rhsState);
       if (lhsState != joinState) changed = true;
       memoryMap[mem] = joinState;
     }
     return changed? mlir::ChangeResult::Change : mlir::ChangeResult::NoChange;
   }
 
-  void print(llvm::raw_ostream &os) const override {};
+  void print(llvm::raw_ostream &os) const override {
+    os << "\n[DEBUG] Current MemoryMap: ";
+    for (const auto& entry: memoryMap) {
+      os << "\n (Mem: "; 
+      entry.getFirst().printAsOperand(os, {});
+      os << ", State: " << entry.getSecond().toStr() << ")";
+    }
+  };
 };
 
 class TargetFoldabilityAnalysis: public mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice> {
 private:
   func::FuncOp currentFunc;
 
+  void opDataUpdate(
+    ::mlir::Operation::operand_range mapVars, 
+    MemoryAliasLattice* after,
+    llvm::function_ref<void(MemState&, ::mlir::omp::ClauseMapFlags, ::mlir::omp::VariableCaptureKind)> updater
+  ) {
+    for (const auto& mapVar: mapVars) {
+      auto root = getRootMem(mapVar);
+      llvm::dbgs() << "\n the mapVar is: ";
+      mapVar.printAsOperand(llvm::dbgs(), {});
+      llvm::dbgs() << ", the root is: ";
+      root.printAsOperand(llvm::dbgs(), {});
+      // assert(after->memoryMap.contains(root)); FIXME: think a better way of handling this
+      auto& state = after->memoryMap[root];
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp()); 
+      assert(mapInfoOp);
+      auto direction = mapInfoOp.getMapType();
+      auto captureType = mapInfoOp.getMapCaptureType();
+      updater(state, direction, captureType);
+    }
+  } 
+
+  // These 3 are standalone operations
+  void handleTargetUpdateOp(omp::TargetUpdateOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      assert(!(hasFrom && hasTo));
+      if (hasFrom) {
+        // from device to host
+        state.hostSubState = state.deviceSubState;
+        // refCount no change
+        return;
+      }
+      if (hasTo) {
+        // from host to device 
+        state.deviceSubState = state.hostSubState;
+        // refCount no change
+        return;
+      } 
+      llvm_unreachable("Unexpected target update direction");
+      return;
+    });
+  };
+
+  void handleTargetEnterDataOp(omp::TargetEnterDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      // According to https://www.openmp.org/spec-html/5.0/openmpsu58.html: A map-type must be specified in all map clauses and must be either to or alloc.
+      // `alloc` will be come `storage` clause
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);
+      // common clause flag
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(hasAlloc || hasTo);
+      assert(!(hasAlloc && hasTo));
+      if (hasAlloc) {
+        // 1. If not mapped (0, 0), alloc undefined
+        // 2. If mapped (Z+, Z+), keep the same
+        // 3. If (0, Z+), then JOIN(deviceValue, TOP) = TOP, the same with 1
+        if (state.refCountRange.first == 0) {
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // DO NOTHING
+        }
+        state.incRefCounts();
+        return;
+      } 
+      if (hasTo) {
+        state.incRefCounts();
+        if (hasAlways || state.refCountRange.second == 0) {
+          state.deviceSubState = state.hostSubState;
+          return;
+        } 
+        // {*, Z+}
+        if (state.refCountRange.first == 0) {
+          // {0, Z+}
+          state.deviceSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          return;
+        } 
+        // {Z+, Z+}
+        // DO NOTHING except for refCountRange increase
+        return;
+      }
+      llvm_unreachable("Unexpected target update direction");
+      return;
+    });
+  };
+
+  void handleTargetExitDataOp(omp::TargetExitDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      //  A map-type must be specified in all map clauses and must be either from, release, or delete. (https://www.openmp.org/spec-html/5.0/openmpsu59.html)
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);  
+      bool hasRelease = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+      bool hasDelete = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::del);
+      assert((int)hasFrom + (int)hasRelease + (int)hasDelete == 1 && "target exit data map-type must be from, release, or delete");
+      // common flag
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        if (hasAlways) {
+          // (0, 0) do nothing
+          // (0, Z+) host = join(host, device) 
+          // (1, Z+) set host to device
+          if (state.refCountRange.first == 0) {
+            if (state.refCountRange.second >= 1) {
+              state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+            }
+          } else {
+            // (1, Z+)
+            state.hostSubState = state.deviceSubState;
+          }
+          state.decRefCounts();
+          if (state.refCountRange.second == 0) {
+            state.deviceSubState.reset();
+          }
+          return;
+        }
+        if (state.refCountRange.first == 0) {
+          if (state.refCountRange.second == 0) {
+            // (0, 0), DO NOTHING
+          } else {
+            // (0, Z+):
+            // - if 0.. do nothing
+            // - if 1.. copy back and reset
+            // - if 1+.. do nothing
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+            // device state = join(BOT, device state) = device state
+          }
+        } else if (state.refCountRange.first == 1){
+          // - if 1: copy back and reset 
+          // - else: do nothing
+          if (state.refCountRange.second == 1) {
+            state.hostSubState = state.deviceSubState;
+          } else {
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          }
+          // device state = join(BOT, device state) = device state
+        } else {
+          // DO NOTHING
+        }
+        state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasRelease) {
+        state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasDelete) {
+        state.deviceSubState.reset();
+        state.refCountRange = {0, 0};
+        return;
+      }
+      llvm_unreachable("Unexpected target update direction");
+    });
+  }
+
+  void handleTargetOpEnteringEdge(omp::TargetOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      if (captureType == omp::VariableCaptureKind::ByCopy) {
+        // If it is by copy, then it actually works like a first private. 
+        return;
+      }
+      // Following are ByRef 
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(!(hasTo && hasAlloc));
+      if (hasTo) {
+        if (state.refCountRange.second == 0 || hasAlways) {
+          // (0, 0)
+          state.deviceSubState = state.hostSubState;
+        } else {
+          if (state.refCountRange.first == 0) {
+            // (0, Z+)
+            state.deviceSubState = SubState::join(state.deviceSubState, state.hostSubState);
+          } else {
+            // (Z+, Z+): DO NOTHING
+          }
+        }
+        state.incRefCounts();
+        return;
+      }
+      if (hasAlloc || (hasFrom && !hasTo)) {
+        if (state.refCountRange.first == 0) {
+          // (0, 0): device -> TOP
+          // (0, Z+): device -> join(device, TOP) = TOP
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // (Z+, Z+): do nothing
+        }
+        state.incRefCounts();
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
+    });
+    auto offSet = getBlockMapVarsOffset(op);
+    for (unsigned int i = 0; i < op.numMapBlockArgs(); i++) {
+      auto argIdx = i + offSet; 
+      Value arg = op.getRegion().front().getArgument(argIdx);
+      Value mapVar = op.getMapVars()[i];
+      auto mapVarRoot = getRootMem(mapVar); 
+      assert(after->memoryMap.contains(mapVarRoot));
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
+      if (mapInfoOp.getMapCaptureType() == mlir::omp::VariableCaptureKind::ByCopy) {
+        after->memoryMap[arg] = {
+          after->memoryMap[mapVarRoot].hostSubState, 
+          {SubState::State::Bottom, nullptr},
+          {0, 0}
+        };
+      } else {
+        after->memoryMap[arg] = {
+          after->memoryMap[mapVarRoot].deviceSubState, 
+          {SubState::State::Bottom, nullptr},
+          {0, 0}
+        };
+      }
+    }
+  }
+
+  void handleTargetOpExitingEdge(omp::TargetOp op, MemoryAliasLattice *after) {
+    auto offSet = getBlockMapVarsOffset(op);
+    for (unsigned int i = 0; i < op.numMapBlockArgs(); i++) {
+      auto argIdx = i + offSet; 
+      Value arg = op.getRegion().front().getArgument(argIdx);
+      Value mapVar = op.getMapVars()[i];
+      auto mapVarRoot = getRootMem(mapVar); 
+      assert(llvm::isa<omp::MapInfoOp>(mapVar.getDefiningOp()));
+      // FIXME: find a better way to handle this
+      // assert(after->memoryMap.contains(mapVarRoot));
+      // assert(after->memoryMap.contains(arg));
+      auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(mapVar.getDefiningOp());
+      if (mapInfoOp.getMapCaptureType() == mlir::omp::VariableCaptureKind::ByRef) {
+        after->memoryMap[mapVarRoot].deviceSubState = after->memoryMap[arg].hostSubState;
+      } else {
+        // DO NOTHING if ByCopy
+      }
+    }
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      if (captureType == omp::VariableCaptureKind::ByCopy) {
+        // If it is by copy, then it actually works like a first private. 
+        return;
+      }
+      // Following are ByRef 
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        // conditional copy back
+        // FIXME: find a way to assert
+        // assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
+        if (state.refCountRange.second == 1 || hasAlways) {
+          // (1, 1) or always: copy back
+          state.hostSubState = state.deviceSubState;
+        } else {
+          if (state.refCountRange.first == 1) {
+            // (1, 1+)
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          } else {
+            // (1+, 1+): do nothing
+          }
+        }
+        state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasAlloc || (hasTo && !hasFrom)) {
+        // DO NOTHING
+        state.decRefCounts(); 
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
+    });
+  }
+
+  void handleTargetDataOpEnteringEdge(omp::TargetDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      assert(!(hasTo && hasAlloc));
+      if (hasTo) {
+        if (state.refCountRange.second == 0 || hasAlways) {
+          // (0, 0)
+          state.deviceSubState = state.hostSubState;
+        } else {
+          if (state.refCountRange.first == 0) {
+            // (0, Z+)
+            state.deviceSubState = SubState::join(state.deviceSubState, state.hostSubState);
+          } else {
+            // (Z+, Z+): DO NOTHING
+          }
+        }
+        state.incRefCounts();
+        return;
+      }
+      if (hasAlloc || (hasFrom && !hasTo)) {
+        if (state.refCountRange.first == 0) {
+          // (0, 0): device -> TOP
+          // (0, Z+): device -> join(device, TOP) = TOP
+          state.deviceSubState = {SubState::State::Top, nullptr};
+        } else {
+          // (Z+, Z+): do nothing
+        }
+        state.incRefCounts();
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
+    });
+  }
+
+  void handleTargetDataOpExitingEdge(omp::TargetDataOp op, MemoryAliasLattice *after) {
+    opDataUpdate(op.getMapVars(), after, [](MemState& state, omp::ClauseMapFlags direction, omp::VariableCaptureKind captureType){
+      assert(captureType == omp::VariableCaptureKind::ByRef);
+      bool hasFrom = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::from);
+      bool hasTo = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::to);  
+      bool hasAlloc = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::storage);
+
+      bool hasAlways = omp::bitEnumContainsAny(direction, omp::ClauseMapFlags::always);
+      if (hasFrom) {
+        // conditional copy back
+        assert(state.refCountRange.first >= 1 && state.refCountRange.second >= 1);
+        if (state.refCountRange.second == 1 || hasAlways) {
+          // (1, 1) or always: copy back
+          state.hostSubState = state.deviceSubState;
+        } else {
+          if (state.refCountRange.first == 1) {
+            // (1, 1+)
+            state.hostSubState = SubState::join(state.hostSubState, state.deviceSubState);
+          } else {
+            // (1+, 1+): do nothing
+          }
+        }
+        state.decRefCounts();
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      if (hasAlloc || (hasTo && !hasFrom)) {
+        // DO NOTHING
+        state.decRefCounts(); 
+        if (state.refCountRange.second == 0) {
+          state.deviceSubState.reset();
+        }
+        return;
+      }
+      llvm_unreachable("ignore other cases for prototyping");
+    });
+  }
+
 public:
   TargetFoldabilityAnalysis(DataFlowSolver& solver, func::FuncOp func):
     DenseForwardDataFlowAnalysis(solver), currentFunc(func) {};
 
+  void visitRegionBranchControlFlowTransfer(
+    RegionBranchOpInterface branch, 
+    std::optional<unsigned int> regionFrom, 
+    std::optional<unsigned int> regionTo, const 
+    MemoryAliasLattice &before, 
+    MemoryAliasLattice *after
+  ) override {
+    auto* op = branch.getOperation();
+    assert(op);
+
+    llvm::errs() << "\n[RB] " << op->getName() << " from=";
+    if (regionFrom)
+      llvm::errs() << *regionFrom;
+    else
+      llvm::errs() << "parent";
+
+    llvm::errs() << " to=";
+    if (regionTo)
+      llvm::errs() << *regionTo;
+    else
+      llvm::errs() << "parent";
+    llvm::errs() << "\n";
+
+
+    MemoryAliasLattice candidate(after->getAnchor());
+    candidate.memoryMap = before.memoryMap;
+
+    if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(op)) {
+      // Entering:
+      // `regionFrom` is nullptr, means it is the parentOP. 
+      // `regionTo` is 0, means it is the first region of the Op.
+      // In summary, this means from the edge going from the parentOp to the region of the it.
+      if (!regionFrom && regionTo && *regionTo == 0) {
+        handleTargetOpEnteringEdge(targetOp, &candidate); 
+      } else if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleTargetOpExitingEdge(targetOp, &candidate);
+      } else {
+        llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+      }
+      propagateIfChanged(after, after->join(candidate));
+      return;
+    }
+    if (auto targetDataOp = llvm::dyn_cast<omp::TargetDataOp>(op)) {
+      if (!regionFrom && regionTo && *regionTo == 0) {
+        handleTargetDataOpEnteringEdge(targetDataOp, &candidate);
+      } else if (regionFrom && *regionFrom == 0 && !regionTo) {
+        handleTargetDataOpExitingEdge(targetDataOp, &candidate);
+      } else {
+        llvm_unreachable("Shold only visit the entering edge and the exiting edge.");
+      }
+      propagateIfChanged(after, after->join(candidate));
+      return;
+    }
+
+    mlir::dataflow::DenseForwardDataFlowAnalysis<MemoryAliasLattice>
+      ::visitRegionBranchControlFlowTransfer(branch, regionFrom, regionTo, before, after);
+    return;
+  }
+
+  // handle standalone operations
   LogicalResult visitOperation(
     mlir::Operation *op,
     const MemoryAliasLattice &before,
     MemoryAliasLattice *after
   ) override { 
-    after->memoryMap = before.memoryMap;
 
-    if (op->getParentOfType<omp::TargetOp>()) {
-      if (auto termOp = llvm::dyn_cast<omp::TerminatorOp>(op)) {
-        if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(termOp->getParentOp())) {
-          for (mlir::Value mapVar : targetOp.getMapVars()) {
-            if (auto mapInfo = llvm::dyn_cast_or_null<omp::MapInfoOp>(mapVar.getDefiningOp())) {
-              if (mapInfo.getMapCaptureType() == omp::VariableCaptureKind::ByRef) {
-                mlir::Value rootMem = getRootMem(mapInfo.getVarPtr());
-                after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
-              }
-            }
-          }
-        };
-      }
-      return mlir::success();
-    }
+    MemoryAliasLattice candidate(after->getAnchor());
+    candidate.memoryMap = before.memoryMap;
 
     if (op->getDialect()->getNamespace() == "arith") {
       // Skip and do not print log
+      propagateIfChanged(after, after->join(candidate));
       return mlir::success();
     }
 
     llvm::TypeSwitch<Operation*>(op)
+        .Case([&](omp::TargetUpdateOp targetUpdateData){handleTargetUpdateOp(targetUpdateData, &candidate);})
+        .Case([&](omp::TargetEnterDataOp enterOp){handleTargetEnterDataOp(enterOp, &candidate);})
+        .Case([&](omp::TargetExitDataOp exitOp){handleTargetExitDataOp(exitOp, &candidate);})
         .Case([&](fir::AllocaOp alloca){
-          after->memoryMap[alloca.getResult()] = {MemoryValueState::State::Bottom, nullptr};
+          (&candidate)->memoryMap[alloca.getResult()] = {
+            {SubState::State::Bottom, nullptr},
+            {SubState::State::Bottom, nullptr},
+            {0, 0}
+          };
         })
         .Case([&](omp::MapInfoOp info){
-          // If byCopy, the root of the result is the result itself.
+          llvm::dbgs() << "\n[DEBUG] Handle: ";
+          info.print(llvm::dbgs());
+          (&candidate)->print(llvm::dbgs());
           if (info.getMapCaptureType() == omp::VariableCaptureKind::ByCopy) {
             auto varPtrRoot = getRootMem(info.getVarPtr());
-            if (after->memoryMap.contains(varPtrRoot)) {
-              after->memoryMap[info.getResult()] = after->memoryMap[varPtrRoot]; 
+            if ((&candidate)->memoryMap.contains(varPtrRoot)) {
+              // If byCopy, the root of the result is the result itself.
+              (&candidate)->memoryMap[info.getResult()] = (&candidate)->memoryMap.at(varPtrRoot); 
             } else {
               llvm::dbgs() << "\n[DEBUG]Cannot find varPtrRoot in status: ";
               info.print(llvm::dbgs());
               llvm::dbgs() << ", root is: ";
               varPtrRoot.printAsOperand(llvm::dbgs(), {});
-              after->memoryMap[info.getResult()] = {MemoryValueState::State::Top, nullptr};
+              (&candidate)->memoryMap[info.getResult()] = {
+                {SubState::State::Top, nullptr},
+                {SubState::State::Top, nullptr},
+                {0, INT_MAX}
+              };
             }
-          } 
+          } else {
+            assert(info.getMapCaptureType() == omp::VariableCaptureKind::ByRef);
+            // ByRef: mapInfoOp does not change the value of anything, thus do nothing.
+          }
         })
         .Case([&](fir::StoreOp storeOp){
           auto rootMem = getRootMem(storeOp.getMemref());
-          if (after->memoryMap.contains(rootMem)) {
-            MemoryValueState newState = {MemoryValueState::State::Known, storeOp.getValue()};
-            after->memoryMap[rootMem] = newState;
+          if ((&candidate)->memoryMap.contains(rootMem)) {
+            (&candidate)->memoryMap[rootMem].hostSubState = {SubState::State::Known, storeOp.getValue()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of StoredOp: ";
             storeOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
+            (&candidate)->memoryMap[rootMem] = {
+              {SubState::State::Top, nullptr},
+              {SubState::State::Top, nullptr},
+              {0, INT_MAX},
+           };
           }
         })
         .Case([&](hlfir::AssignOp assignOp){
           auto rootMem = getRootMem(assignOp.getLhs());
-          if (after->memoryMap.contains(rootMem)) {
-            MemoryValueState newState = {MemoryValueState::State::Known, assignOp.getRhs()};
-            after->memoryMap[rootMem] = newState;
+          if ((&candidate)->memoryMap.contains(rootMem)) {
+            (&candidate)->memoryMap[rootMem].hostSubState = {SubState::State::Known, assignOp.getRhs()};
           } else {
             llvm::dbgs() << "\n[DEBUG]Cannot find rootMem of assignOp: ";
             assignOp.print(llvm::dbgs());
             llvm::dbgs() << ", rootMem is: ";
             rootMem.printAsOperand(llvm::dbgs(), {});
-            after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
+            (&candidate)->memoryMap[rootMem] = {
+              {SubState::State::Top, nullptr},
+              {SubState::State::Top, nullptr},
+              {0, INT_MAX},
+            };
           }
         })
-        .Case([&](omp::TargetUpdateOp updateOp) {
-          for (mlir::Value mapVar : updateOp.getMapVars()) {
-            if (auto mapInfo = llvm::dyn_cast_or_null<omp::MapInfoOp>(mapVar.getDefiningOp())) {
-              uint64_t mapType = (uint64_t)mapInfo.getMapType();
-              if ((mapType & (uint64_t)omp::ClauseMapFlags::from) != 0) {
-                 mlir::Value rootMem = getRootMem(mapInfo.getVarPtr());
-                 after->memoryMap[rootMem] = {MemoryValueState::State::Top, nullptr};
-              }
-            }
-          }
+        .Case<omp::TargetOp, omp::TargetDataOp>([&](auto){
+          llvm::errs() << "[ERR] Should not appear here: ";
+          op->print(llvm::errs(), {});
+          llvm::errs() << "\n";
         })
-        .Case<omp::TargetOp, omp::MapBoundsOp, func::ReturnOp,
+        .Case<omp::MapBoundsOp, func::ReturnOp,
               hlfir::DeclareOp, fir::ConvertOp, fir::LoadOp,
               fir::DummyScopeOp, fir::ShiftOp, fir::AddrOfOp,
               fir::BoxDimsOp, fir::BoxAddrOp, fir::BoxOffsetOp, 
@@ -697,14 +864,22 @@ public:
           llvm::dbgs() << "\n";
         })
     ;
+    propagateIfChanged(after, after->join(candidate));
     return success();
   }
   void setToEntryState(MemoryAliasLattice *lattice) override {
-    lattice->memoryMap.clear();
+    MemoryAliasLattice entryState(lattice->getAnchor());
+    // This function is supposed to be only called when initialization. Unless we have external function calls.
+    assert(currentFunc && !currentFunc.empty());
     if (!currentFunc || currentFunc.empty()) return;
     for (auto arg: currentFunc.getArguments()) {
-      lattice->memoryMap[arg] = {MemoryValueState::State::Known, arg};
+      entryState.memoryMap[arg] = {
+        {SubState::State::Known, arg},
+        {SubState::State::Top, nullptr},
+        {0, INT_MAX}
+      };
     }
+    propagateIfChanged(lattice, lattice->join(entryState));
   }
 };
 
@@ -713,10 +888,6 @@ enum struct Foldability: uint8_t {
 };
 
 static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir::DataFlowSolver& solver) {
-  llvm::dbgs() << "\n Checking: ";
-  val.printAsOperand(llvm::dbgs(), {});
-  llvm::dbgs() << "\n";
-
   if (argsSet.contains(val)) return true;
   auto* defOp = val.getDefiningOp();
   if (!defOp) {
@@ -730,8 +901,8 @@ static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(root));
     auto state = lattice->memoryMap.at(root);
-    assert(state.state == MemoryValueState::State::Known);
-    return isDependOnArgs(state.storedValue, argsSet, solver);
+    assert(state.hostSubState.state == SubState::State::Known);
+    return isDependOnArgs(state.hostSubState.value, argsSet, solver);
   } 
   if (defOp->getNumOperands() == 0) {
     if (!llvm::isa<arith::ConstantOp>(defOp)) {
@@ -753,30 +924,36 @@ static bool isDependOnArgs(Value val, const llvm::DenseSet<Value>& argsSet, mlir
   return acc;
 }
 
-static Foldability checkFoldability(
+static std::pair<Foldability, Value> checkFoldability(
   Value arg, 
   Value mapVar, 
   omp::TargetOp targetOp, 
   mlir::DataFlowSolver& solver,
   const MemoryAliasLattice* aliasLattice
 ) {
+  // INFO: only fold temporary scalar should already serve our purpose.
+  Type eleTy = fir::unwrapRefType(arg.getType());
+  if (!eleTy.isIntOrIndexOrFloat()) {
+    return {Foldability::Unfoldable, nullptr};
+  }
+
   // INFO: if arg is never declared, we should not fold, as they are metainfo.
   auto declared = false;
   for (Operation* user: arg.getUsers()) {
     if (llvm::isa<hlfir::DeclareOp>(user)) declared = true;
   }
-  if (!declared) return Foldability::Unfoldable;
+  if (!declared) return {Foldability::Unfoldable, nullptr};
 
   
   // INFO: if mapVar is arg, we cannot fold.
   auto root = getRootMem(mapVar);
   auto args = targetOp->getParentOfType<func::FuncOp>().getArguments();
   llvm::DenseSet<Value> argsSet(args.begin(), args.end());
-  if (argsSet.contains(root)) return Foldability::Unfoldable;
+  if (argsSet.contains(root)) return {Foldability::Unfoldable, nullptr};
 
   // INFO: if mapvar is unknown, we can fold in JIT.
   // assert(aliasLattice->memoryMap.contains(root));
-  MemoryValueState valueState;
+  MemState valueState;
   if (aliasLattice->memoryMap.contains(root)) {
     valueState = aliasLattice->memoryMap.at(root);
   } else {
@@ -784,44 +961,37 @@ static Foldability checkFoldability(
     mapVar.printAsOperand(llvm::dbgs(), {});
     llvm::dbgs() << ", with root: \n",
     root.printAsOperand(llvm::dbgs(), {});
-    valueState = {MemoryValueState::State::Top, nullptr};
+    valueState = {{SubState::State::Top, nullptr}, {SubState::State::Top, nullptr}, {0, INT_MAX}};
   }
-  if (valueState.state == MemoryValueState::State::Top) return Foldability::JITFold; 
-  if (valueState.state == MemoryValueState::State::Bottom) return Foldability::AOTTempFold;
-  // INFO: if the value can chase to be depend on any arg, then this is JITFold, else it is constantFold.
-  assert(valueState.state == MemoryValueState::State::Known);
-  assert(valueState.storedValue != nullptr);
-  llvm::dbgs() << "\nWe're checking :";
-  valueState.storedValue.printAsOperand(llvm::dbgs(), {});
-  llvm::dbgs() << "\n";
-  if (isDependOnArgs(valueState.storedValue, argsSet, solver)) {
-    return Foldability::JITFold;
-  }
-  return Foldability::AOTConstFold;
-}
 
-static Operation* trackToAllocaOp(Value mem) {
-  auto* definedOp = mem.getDefiningOp();
-  if (auto allocaOp = llvm::dyn_cast<fir::AllocaOp>(definedOp)) {
-    return allocaOp;
+  SubState joinedState;
+  if (valueState.refCountRange.first == 0 && valueState.refCountRange.second == 0) {
+    // not mapped
+    joinedState = valueState.hostSubState;
+  } else if (valueState.refCountRange.first == 0) {
+    assert(valueState.refCountRange.second > 0);
+    joinedState = SubState::join(valueState.hostSubState, valueState.deviceSubState);
+  } else {
+    assert(valueState.refCountRange.first > 0);
+    // already mapped
+    joinedState = valueState.deviceSubState;
   }
-  if (auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(definedOp)) {
-    return trackToAllocaOp(declareOp.getMemref());
+
+  if (joinedState.state == SubState::State::Top) return {Foldability::JITFold, joinedState.value}; 
+  if (joinedState.state == SubState::State::Bottom) return {Foldability::AOTTempFold, joinedState.value};
+  assert(joinedState.state == SubState::State::Known);
+  assert(joinedState.value != nullptr);
+  llvm::dbgs() << "\nWe're checking :";
+  joinedState.value.printAsOperand(llvm::dbgs(), {});
+  llvm::dbgs() << "\n";
+  if (isDependOnArgs(joinedState.value, argsSet, solver)) {
+    return {Foldability::JITFold, joinedState.value};
   }
-  if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(definedOp)) {
-    return trackToAllocaOp(mapInfoOp.getVarPtr());
-  }
-  if (auto convertOp = llvm::dyn_cast<fir::ConvertOp>(definedOp)) {
-    return trackToAllocaOp(convertOp.getValue());
-  }
-  llvm::errs() << "\n Unexpected Define Op:";
-  definedOp -> print(llvm::errs());
-  llvm_unreachable("Unexpected define op");
-  return nullptr;
+  return {Foldability::AOTConstFold, joinedState.value};
 }
 
 // Print the dataflow chain of val to the target location
-static Value materializeValueV2(
+static Value materializeValue(
   Value mapVarFinalVal, 
   DataFlowSolver& solver,
   llvm::DenseMap<Value, Value>& cloneCache,
@@ -835,65 +1005,51 @@ static Value materializeValueV2(
     auto* lattice = solver.lookupState<MemoryAliasLattice>(solver.getProgramPointBefore(loadOp));
     assert(lattice->memoryMap.contains(loadOp.getMemref()));
     auto stat = lattice->memoryMap.at(loadOp.getMemref());
-    assert(stat.state == MemoryValueState::State::Known);
-    cloneCache[mapVarFinalVal] = materializeValueV2(stat.storedValue, solver, cloneCache, opBuilder);
+    cloneCache[mapVarFinalVal] = materializeValue(stat.hostSubState.value, solver, cloneCache, opBuilder);
   }
 
   // If has a corresponding operation.
   IRMapping vMap;
   for (auto operand: defOp->getOperands()) {
-    vMap.map(operand, materializeValueV2(operand, solver, cloneCache, opBuilder));
+    vMap.map(operand, materializeValue(operand, solver, cloneCache, opBuilder));
   }
   auto* newOp = opBuilder.clone(*defOp, vMap);
   cloneCache[mapVarFinalVal] = newOp->getResult(0);
   return cloneCache[mapVarFinalVal];
 }
                                                                                                                             
-// FIXME: not always track back to alloca, maybe track back to address_of
-static Value createLocalAllocaV2(
+// TODO: not always track back to alloca, maybe track back to address_of
+static Value createLocalAlloca(
   Block& entryBlock,
   Value mapVar,
   Value arg,
   OpBuilder& opBuilder,
   omp::TargetOp targetOp
 ) {
-  auto oldAllocaOp = llvm::dyn_cast<fir::AllocaOp>(trackToAllocaOp(mapVar));
-  assert(oldAllocaOp);
+  Type argTy = arg.getType();
+  Type eleTy = fir::unwrapRefType(argTy);
   auto newAllocaOp = fir::AllocaOp::create(
-    opBuilder, 
-    targetOp.getLoc(), 
-    oldAllocaOp.getInType(), 
-    oldAllocaOp.getUniqName().has_value()? oldAllocaOp.getUniqName().value(): "",
-    oldAllocaOp.getBindcName().has_value()? oldAllocaOp.getBindcName().value(): "",
-    oldAllocaOp.getTypeparams(),
-    oldAllocaOp.getShape(),
-    oldAllocaOp->getAttrs()
-  );
-  mlir::Value replacementMem = newAllocaOp.getResult();
-  if (replacementMem.getType() != arg.getType()) {
+    opBuilder, targetOp.getLoc(), eleTy, "", "", ValueRange{}, {}, {});
+  Value replacementMem = newAllocaOp.getResult();
+  if (replacementMem.getType() != argTy) {
     replacementMem = fir::ConvertOp::create(opBuilder, targetOp.getLoc(), arg.getType(), replacementMem).getResult();
   }
-  mlir::Type valType = fir::unwrapRefType(replacementMem.getType());
-  auto zeroConstant = fir::ZeroOp::create(opBuilder, targetOp.getLoc(), valType);
+  auto zeroConstant = fir::ZeroOp::create(opBuilder, targetOp.getLoc(), eleTy);
   fir::StoreOp::create(opBuilder, targetOp.getLoc(), zeroConstant.getResult(), replacementMem);
   return replacementMem;
 }
                                                                                                                             
-static void assignToLocalAllocaV2(
+static void assignToLocalAlloca(
   Value replacementMem,
-  Value mapVar,
+  Value mapVarVal,
   omp::TargetOp targetOp,
-  const MemoryAliasLattice& aliasLattice,
   DataFlowSolver& solver,
   OpBuilder& opBuilder,
   llvm::DenseMap<Value, Value>& cloneCache
 ) {
-  auto root = getRootMem(mapVar);
-  assert(aliasLattice.memoryMap.contains(root));
-  auto mapVarVal = aliasLattice.memoryMap.at(root).storedValue;
   if (mapVarVal != nullptr) {
     mapVarVal.printAsOperand(llvm::dbgs(), {});
-    auto finalVal = materializeValueV2(mapVarVal, solver, cloneCache, opBuilder);
+    auto finalVal = materializeValue(mapVarVal, solver, cloneCache, opBuilder);
     fir::StoreOp::create(opBuilder, targetOp.getLoc(), finalVal, replacementMem);
   }
 }
@@ -911,14 +1067,28 @@ static void foldConstantPrivates(
   auto mapVarOffset = getBlockMapVarsOffset(targetOp);
   assert(mapVarOffset == 0); // as other argumemts have already been folded inside map_entries
   
-  llvm::DenseMap<Value, Foldability> foldabilityMap;
+  llvm::DenseMap<Value, std::pair<Foldability, Value>> foldabilityMap;
   for (int i = int(targetOp.numMapBlockArgs()) - 1; i >= 0; i--) {
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = checkFoldability(arg, mapVar, targetOp, solver, aliasLattice); 
-    foldabilityMap[mapVar] = foldability;
+    auto foldabilityRes = checkFoldability(arg, mapVar, targetOp, solver, aliasLattice); 
+    foldabilityMap[mapVar] = foldabilityRes;
   }
+  // NOTE: DEBUG
+  llvm::dbgs() << "\n[DEBUG] Foldability Map: \n";
+  for (const auto&[value, pair]: foldabilityMap) {
+    llvm::dbgs() << "Value: ";
+    value.printAsOperand(llvm::dbgs(), {});
+    llvm::dbgs() << ", Foldability: " << std::to_string(int(pair.first)) << " , foldTo: ";
+    if (pair.second) {
+      pair.second.printAsOperand(llvm::dbgs(), {});
+    } else {
+
+    }
+    llvm::dbgs() << "\n";
+  }
+  llvm::dbgs() << "[DEBUG] Foldability Map End \n";
 
   OpBuilder::InsertionGuard guardAOTFold(opBuilder); 
   opBuilder.setInsertionPointToStart(&entryBlock);
@@ -926,14 +1096,15 @@ static void foldConstantPrivates(
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = foldabilityMap[mapVar];
+    auto foldabilityRes = foldabilityMap[mapVar];
+    auto foldability = foldabilityRes.first;
     if (foldability == Foldability::Unfoldable) {
       continue;
     }
     if (foldability == Foldability::AOTTempFold || foldability == Foldability::AOTConstFold) {
-        Value replacementMem = createLocalAllocaV2(entryBlock, mapVar, arg, opBuilder, targetOp);
+        Value replacementMem = createLocalAlloca(entryBlock, mapVar, arg, opBuilder, targetOp);
       if (foldability == Foldability::AOTConstFold) {
-        assignToLocalAllocaV2(replacementMem, mapVar, targetOp, *aliasLattice, solver, opBuilder, cloneCache);
+        assignToLocalAlloca(replacementMem, foldabilityRes.second, targetOp, solver, opBuilder, cloneCache);
       }
       arg.replaceAllUsesWith(replacementMem);
       assert(entryBlock.getArgument(argIdx).getUses().empty());
@@ -948,7 +1119,7 @@ static void foldConstantPrivates(
     auto argIdx = mapVarOffset + i; 
     auto arg = entryBlock.getArgument(argIdx);
     auto mapVar = targetOp.getMapVars()[i];
-    auto foldability = foldabilityMap[mapVar];
+    auto foldability = foldabilityMap[mapVar].first;
     if (foldability == Foldability::JITFold) {
       assert(arg.getNumUses() == 1); // should only have a declare operation
       for (auto* user : arg.getUsers()) {
@@ -1005,7 +1176,7 @@ static void foldConstantPrivates(
   llvm::SmallVector<Attribute> jitArgAttrs;
   for (const auto& mapVar: targetOp.getMapVars()) {
     assert(foldabilityMap.contains(mapVar));
-    if (foldabilityMap[mapVar] == Foldability::JITFold) {
+    if (foldabilityMap[mapVar].first == Foldability::JITFold) {
       auto strAttr = StringAttr::get(targetOp.getContext());      
       jitArgAttrs.push_back(strAttr);
     } else {
@@ -1077,7 +1248,7 @@ static std::optional<PrivateOmpOp> findInPrivateVars(Value val) {
       if (llvm::is_contained(parallelOp.getPrivateVars(), val)) {
         return parallelOp; 
       }
-    } else if (auto distributeOp = llvm::dyn_cast<omp::ParallelOp>(owner)) {
+    } else if (auto distributeOp = llvm::dyn_cast<omp::DistributeOp>(owner)) {
       if (llvm::is_contained(distributeOp.getPrivateVars(), val)) {
         return distributeOp; 
       }
@@ -1542,37 +1713,49 @@ public:
           }
         }
       } else if (targetOp.walk([&](omp::TargetOp top){if (top != targetOp) {return WalkResult::interrupt();} return WalkResult::advance();}).wasInterrupted()==false) {
-        // llvm::dbgs() << "\nA1:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA1 End\n";
+        llvm::dbgs() << "\nA1:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA1 End\n";
         llvm::SmallVector<int> indicesForAbsorbedHostEvalVars;
         absorbHostEvalVarsToMapEntries(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
         removePrivateVarsFromMapEntry(targetOp, opBuilder, indicesForAbsorbedHostEvalVars);
-        // llvm::dbgs() << "\nA2:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA2 End\n";
+        llvm::dbgs() << "\nA2:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA2 End\n";
         auto wrappers = getOmpWrappers(targetOp);
         flattenTargetOp(wrappers, targetOp, opBuilder);
-        // llvm::dbgs() << "\nA3:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3 End\n";
+        llvm::dbgs() << "\nA3:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3 End\n";
 
         PassManager pm(&context);
         pm.addPass(mlir::createCSEPass());
         pm.addPass(mlir::createCanonicalizerPass());
         if (failed(pm.run(moduleOp))) {
           llvm::errs() << "Fail to preprocess the moduleOp!\n";
-          // TODO: should have fallback processing!
-          std::exit(EXIT_FAILURE);
+          std::exit(EXIT_FAILURE); // TODO: fall back processsing
         };
 
+
+        llvm::dbgs() << "\nA3.5:\n"; moduleOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA3.5 End\n";
         DataFlowSolver solver;
         auto funcOp = targetOp->getParentOfType<func::FuncOp>();
         assert(funcOp);
-        solver.load<dataflow::DeadCodeAnalysis>(); // TODO: this should be loaded, but I comment it out to check the error message
+        solver.load<dataflow::DeadCodeAnalysis>();
+        solver.load<dataflow::SparseConstantPropagation>();
         solver.load<TargetFoldabilityAnalysis>(funcOp);
         if (mlir::failed(solver.initializeAndRun(funcOp))) {
           moduleOp.emitError("Dataflow analysis failed to coverage");
           return;
         }
 
-        // llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
+        llvm::dbgs() << "\nA4:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA4 End\n";
         foldConstantPrivates(targetOp, opBuilder, solver);
-        // llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
+        llvm::dbgs() << "\nA5:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA5 End\n";
+
+        // INFO: Liveness analysis
+        PassManager pm2(&context);
+        pm2.addPass(mlir::createMem2Reg());
+        pm2.addPass(mlir::createCanonicalizerPass());
+        if (failed(pm2.run(funcOp))) {
+          llvm::errs() << "Fail to preprocess the functionOp!\n";
+          std::exit(EXIT_FAILURE); // TODO: fall back processing
+        }
+        llvm::dbgs() << "\nA6:\n"; funcOp.print(llvm::dbgs()); llvm::dbgs() <<"\nA6 End\n";
       } else {
         LDBG() << "Ignoring non-workdistribute and nested target op:\n" << *targetOp;
         continue;
@@ -1587,7 +1770,7 @@ public:
             FunctionType::get(&context, targetOp.getRegion().begin()->getArgumentTypes(), {}));
         b.cloneRegionBefore(targetOp.getRegion(), f.getRegion(), f.getRegion().begin());
 
-        //TODO: set attribute to the function argument
+        //TODO: set attribute to the function argument, this probably not needed as JITFold has already been done!
         if (auto foldabilityArray = targetOp->getAttrOfType<ArrayAttr>("jit_foldability")) {
           assert(f.getNumArguments() == foldabilityArray.size());          
           for (uint i = 0; i < f.getNumArguments(); i++) {
