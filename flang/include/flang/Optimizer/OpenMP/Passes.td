@@ -109,6 +109,14 @@ def LowerWorkdistributeToJit : Pass<"lower-workdistribute-to-jit", "::mlir::Modu
   let summary = "Lower workdistributedwi construct";
 }
 
+def MaterializePrivates: Pass<"materialize-privates", "::mlir::ModuleOp"> {
+  let summary = "Fold privates with shadowing";
+}
+
+def FlattenOpenMPTarget : Pass<"flatten-target", "::mlir::ModuleOp"> {
+  let summary = "Flatten openmp target";
+}
+
 def GenericLoopConversionPass
     : Pass<"omp-generic-loop-conversion", "mlir::func::FuncOp"> {
   let summary = "Converts OpenMP generic `omp.loop` to semantically "
