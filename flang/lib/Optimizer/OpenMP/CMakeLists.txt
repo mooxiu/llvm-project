@@ -13,6 +13,8 @@ add_flang_library(FlangOpenMPTransforms
   LowerWorkshare.cpp
   LowerNontemporal.cpp
   SimdOnly.cpp
+  FlattenTarget.cpp
+  MaterializePrivates.cpp
 
   DEPENDS
   FIRDialect

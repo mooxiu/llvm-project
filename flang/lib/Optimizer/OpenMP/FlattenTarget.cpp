@@ -4,9 +4,12 @@
 #include "flang/Optimizer/OpenMP/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/ErrorHandling.h"
+#include <alloca.h>
 #include <cassert>
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
+#include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
@@ -24,128 +27,106 @@ using namespace mlir;
 
 namespace {
 
-  static unsigned getBlockHostEvalVarsOffset(omp::TargetOp targetOp) {
+static unsigned getPrivateOffset(Operation* wrapper) {
+  return 0;
+}
+
+static unsigned getHostEvalVarsOffset(Operation* wrapper) {
+  if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(wrapper)) {
     return targetOp.numHasDeviceAddrBlockArgs();
   }
+  llvm_unreachable("unexpected type for getting hostEvalVars Offset!");
+}
 
-  static unsigned getBlockMapVarsOffset(omp::TargetOp targetOp) {
+static unsigned getMapVarsOffset(Operation* wrapper) {
+  if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(wrapper)) {
     return targetOp.numHasDeviceAddrBlockArgs()
       + targetOp.numInReductionBlockArgs()
       + targetOp.numHostEvalBlockArgs();
   }
+  llvm_unreachable("unexpected type for getting mapvars Offset!");
+}
 
+static unsigned getReductionVarsOffset(Operation* wrapper) {
+  return llvm::TypeSwitch<Operation*, unsigned>(wrapper)
+    .Case([&](omp::WsloopOp wsLoopOp){
+      // [private_vars, reduction_vars]
+      return wsLoopOp.numPrivateBlockArgs();
+    })
+    .Case([&](omp::TeamsOp teamsOp){
+      // [private_vars, reduction_vars]
+      return teamsOp.numPrivateBlockArgs();
+    })
+    .Case([&](omp::SimdOp simdOp){
+      // [private_vars, reduction_vars]
+      return simdOp.numPrivateBlockArgs();
+    })
+    .Default([&](Operation*) -> unsigned{
+      llvm_unreachable("unexpected operation for getting reduction vars offset!");
+    });
+}
 
-  using PrivateOmpOp = std::variant<omp::TeamsOp, 
-                                    omp::ParallelOp, 
-                                    omp::DistributeOp,
-                                    omp::WsloopOp, 
-                                    omp::SimdOp>;
+// INFO: Only support private and firstprivate of scalar value.
+// template<typename OMPConstruct> 
+struct MaterializePrivatePattern: public OpRewritePattern<omp::ParallelOp> {
+  using OpRewritePattern<omp::ParallelOp>::OpRewritePattern;
 
-
-  static unsigned getReductionVarsOffset(Operation* wrapper) {
-    auto offset = 0;
-    llvm::TypeSwitch<Operation*>(wrapper)
-      .Case([&](omp::WsloopOp wsLoopOp){
-        // [private_vars, reduction_vars]
-        offset = wsLoopOp.numPrivateBlockArgs();
-        return;
-      })
-      .Case([&](omp::TeamsOp teamsOp){
-        // [private_vars, reduction_vars]
-        offset = teamsOp.numPrivateBlockArgs();
-        return;
-      })
-      .Case([&](omp::SimdOp simdOp){
-        // [private_vars, reduction_vars]
-        offset = simdOp.numPrivateBlockArgs();
-        return;
-      })
-      .Default([&](Operation*){return;});
-    return offset;
+  omp::PrivateClauseOp findPrivateRecipe(omp::ParallelOp op, SymbolRefAttr privateSym) const {
+    return SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(op, privateSym);
   }
 
-  
-  static std::optional<PrivateOmpOp> findInPrivateVars(Value val) {
-    for (const auto& use: val.getUses()) {
-      auto* owner = use.getOwner();
-      if (auto teamsOp = llvm::dyn_cast<omp::TeamsOp>(owner)) {
-        if (llvm::is_contained(teamsOp.getPrivateVars(), val)) {
-          return teamsOp;
-        }
-      } else if (auto parallelOp = llvm::dyn_cast<omp::ParallelOp>(owner)) {
-        if (llvm::is_contained(parallelOp.getPrivateVars(), val)) {
-          return parallelOp; 
-        }
-      } else if (auto distributeOp = llvm::dyn_cast<omp::ParallelOp>(owner)) {
-        if (llvm::is_contained(distributeOp.getPrivateVars(), val)) {
-          return distributeOp; 
-        }
-      } else if (auto wsloopOp = llvm::dyn_cast<omp::WsloopOp>(owner)) {
-        if (llvm::is_contained(wsloopOp.getPrivateVars(), val)) {
-          return wsloopOp;
-        }
-      } else if (auto simdOp = llvm::dyn_cast<omp::SimdOp>(owner)) {
-        if (llvm::is_contained(simdOp.getPrivateVars(), val)) {
-          return simdOp;
-        }
-      }
+  LogicalResult matchAndRewrite(omp::ParallelOp op, PatternRewriter &rewriter) const {
+    auto offset = getPrivateOffset(op);
+    if (op.numPrivateBlockArgs() == 0) {
+      return failure();
     }
-    return std::nullopt;
-  }
 
-  static void shadowGlobalVarWithLocalVar(PrivateOmpOp wrapper, Value globalVar, OpBuilder& opBuilder) {
-    std::visit([&](auto&& op){
-      auto privateVars = op.getPrivateVars();
-      auto it = llvm::find(privateVars, globalVar);
-      if (it != privateVars.end()) {
-      // showdow global var with local var
-        unsigned idx = std::distance(privateVars.begin(), it);
-        auto innerArg = op.getRegion().front().getArgument(idx);
-
-        hlfir::DeclareOp innerDOp = nullptr;
-        Value localVal = nullptr;
-        for (Operation* user: innerArg.getUsers()) {
-          if (auto innerDeclareOp = llvm::dyn_cast<hlfir::DeclareOp>(user)) {
-            innerDOp = innerDeclareOp;
-            localVal = innerDeclareOp.getBase();
-          }
-        }
-        if (!innerDOp || !localVal) {
-          return;
-        }
-        globalVar.replaceUsesWithIf(localVal, [&](OpOperand& globalUse)-> bool{
-          return op->isAncestor(globalUse.getOwner());
-        });
-        
-        // showdow local var with alloca var
-        auto savedPtr = opBuilder.saveInsertionPoint(); 
-        opBuilder.setInsertionPoint(innerDOp);
-        auto argType = innerArg.getType();
-        auto eleType = argType;
-        if (auto refType = llvm::dyn_cast<fir::ReferenceType>(argType)) {
-          eleType =  refType.getEleTy();
-        }
-        auto allocaOp = fir::AllocaOp::create(opBuilder, innerDOp->getLoc(), eleType);
-        innerDOp.getMemrefMutable().assign(allocaOp.getResult());
-
-        // erase the mapping
-        op.getPrivateVarsMutable().erase(idx);
-        if (auto syms = op.getPrivateSyms()) {
-          llvm::SmallVector<mlir::Attribute> newSyms(syms->getValue());
-          newSyms.erase(newSyms.begin() + idx);
-          if (newSyms.empty()) {
-            op.removePrivateSymsAttr();
-        } else {
-            op.setPrivateSymsAttr(opBuilder.getArrayAttr(newSyms));
-          }
-        }
-        op.getRegion().front().eraseArgument(idx);
-        opBuilder.restoreInsertionPoint(savedPtr);
+    OpBuilder::InsertionGuard guard(rewriter);
+    for (int i = 0; i < op.numPrivateBlockArgs(); i++) {
+      auto privateVar = op.getPrivateVars()[i];
+      auto arg = op->getBlock()->getArgument(offset + i); 
+      
+      auto privateSyms = op.getPrivateSyms();
+      assert(privateSyms);
+      if (!privateSyms) {
+        return failure();
       }
-    }, wrapper);
-  }
+      auto symbol = llvm::dyn_cast<SymbolRefAttr>(privateSyms->getValue()[i]);
+      assert(symbol);
+      if (!symbol) {
+        return failure();
+      }
+      auto recipe = findPrivateRecipe(op, symbol);
+      auto kind = recipe.getDataSharingType();
+      Type type = recipe.getType();
+      // materializePrivate(kind, type, privateVar, arg);
+      // FIXME: should use recipe, kind and type
+      rewriter.setInsertionPointToStart(op->getBlock());      
+      auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), privateVar);
+      auto local = fir::AllocaOp::create(rewriter, op.getLoc(), type);
+      fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), local.getResult());
+      rewriter.replaceAllUsesWith(arg, local.getResult()); 
+    }
 
+    // erase
+    for (int i = op.numPrivateBlockArgs() - 1; i >= 0; i--) {
+      op.getPrivateVarsMutable().erase(i);
+      if (auto syms = op.getPrivateSyms()) {
+        llvm::SmallVector<mlir::Attribute> newSyms(syms->getValue());
+        newSyms.erase(newSyms.begin() + i);
+        if (newSyms.empty()) {
+          op.removePrivateSymsAttr();
+      } else {
+          op.setPrivateSymsAttr(rewriter.getArrayAttr(newSyms));
+        }
+      }
+      op.getRegion().front().eraseArgument(offset + i);
+    }
+    return success();
+  };
+};
 
+struct MaterializeReductionPattern: public OpRewritePattern<omp::ParallelOp> {
   template<typename T>
   static void replaceLocalReductionVars(T wrapper) {
     auto reductionVarsOffset = getReductionVarsOffset(wrapper);
@@ -189,189 +170,53 @@ namespace {
       wrapper->removeAttr(wrapper.getReductionSymsAttrName());
     }
   }
-
-  template<typename T, typename Callable>
-  static bool applyToConcreteType(Operation* wrapper, Callable f) {
-    if (auto concreteOp = llvm::dyn_cast<T>(wrapper)) {
-      f(concreteOp);
-      return true;
-    }
-    return false;
-  }
-  
-
-int getPrivateOffset(Operation* ompConstruct) {
-  return 0;
-}
-
-
-// INFO: Only support private and firstprivate of scalar value.
-// template<typename OMPConstruct> 
-struct MaterializePrivatePattern: public OpRewritePattern<omp::ParallelOp> {
-  using OpRewritePattern<omp::ParallelOp>::OpRewritePattern;
-
-  omp::PrivateClauseOp findPrivateRecipe(omp::ParallelOp op, SymbolRefAttr privateSym) const {
-    return SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(op, privateSym);
-  }
-
-  void materializePrivate(
-    omp::DataSharingClauseType kind, 
-    Type dataType,
-    Value privateVar,
-    Value arg
-  ) const {
-
-  }
-
-  LogicalResult matchAndRewrite(omp::ParallelOp op, PatternRewriter &rewriter) const {
-    auto offset = getPrivateOffset(op);
-    if (op.numPrivateBlockArgs() == 0) {
-      return failure();
-    }
-
-    for (int i = 0; i < op.numPrivateBlockArgs(); i++) {
-      auto privateVar = op.getPrivateVars()[i];
-      auto arg = op->getBlock()->getArgument(offset + i); 
-      
-      auto privateSyms = op.getPrivateSyms();
-      assert(privateSyms);
-      if (!privateSyms) {
-        return failure();
-      }
-      auto symbol = llvm::dyn_cast<SymbolRefAttr>(privateSyms->getValue()[i]);
-      assert(symbol);
-      if (!symbol) {
-        return failure();
-      }
-      auto recipe = findPrivateRecipe(op, symbol);
-      auto kind = recipe.getDataSharingType();
-      Type type = recipe.getType();
-      materializePrivate(kind, type, privateVar, arg);
-    }
-
-    for (int i = 0; i < op.numPrivateBlockArgs(); i++) {
-      op.getPrivateVarsMutable().erase(i);
-      if (auto syms = op.getPrivateSyms()) {
-        llvm::SmallVector<mlir::Attribute> newSyms(syms->getValue());
-        newSyms.erase(newSyms.begin() + i);
-        if (newSyms.empty()) {
-          op.removePrivateSymsAttr();
-      } else {
-          op.setPrivateSymsAttr(rewriter.getArrayAttr(newSyms));
-        }
-      }
-      op.getRegion().front().eraseArgument(offset + i);
-    }
-    return success();
-  };
-};
-
-struct MaterializeReductionPattern: public OpRewritePattern<omp::ParallelOp> {
-
 };
 
 struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
   using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
-
-  // `host_eval_vars` contains info like loop bounds, they will be propagated during the device compilation.
-  // The problem is that it will be promoted as argument, but not really mapped, leading the problem that the JITCode function have more arguments than NumArgs we get. 
-  static void absorbHostEvalVarsToMapEntries(
-    omp::TargetOp targetOp, 
-    OpBuilder& opBuilder,
-    llvm::SmallVector<int>& indicesForAbsorbedHostEvalVars
-  ) {
-    auto& entryBlock = targetOp.getRegion().front();
-
-    auto hostEvalOffset = getBlockHostEvalVarsOffset(targetOp); 
-    unsigned originalHostEvalVarsCount = targetOp.numHostEvalBlockArgs();
-
-    llvm::SmallVector<unsigned> indicesForAbsorbedToBody;
-    llvm::SmallVector<unsigned> indicesForAbsorbedToMapVars;
-    for (unsigned i = 0; i < targetOp.numHostEvalBlockArgs(); i++) {
-      auto arg = targetOp.getHostEvalVars()[i];
-      if (matchPattern(arg, m_Constant())) {
-        indicesForAbsorbedToBody.push_back(i);
-      } else {
-        indicesForAbsorbedToMapVars.push_back(i);
-      }
-    }
-
-    OpBuilder::InsertionGuard guard(opBuilder);
-
-    // absorb some constant values directly into the target body
-    opBuilder.setInsertionPointToStart(&entryBlock);
-    for (const unsigned& idx: indicesForAbsorbedToBody) {
-      auto hostEvalVar = targetOp.getHostEvalVars()[idx];
-      auto hostEvalVarArg = entryBlock.getArgument(hostEvalOffset + idx);
-      assert(hostEvalVar.getType().isInteger());
-      IntegerAttr attr;
-      if (matchPattern(hostEvalVar, m_Constant(&attr))) {
-        auto constOp = arith::ConstantOp::create(opBuilder, targetOp.getLoc(), hostEvalVar.getType(), attr); 
-        hostEvalVarArg.replaceAllUsesWith(constOp.getResult());
-      } else {
-        llvm::errs() << "Should be pattern matched!\n";
-        std::exit(EXIT_FAILURE);
-      }
-    }
-
-    // Append HostEvalVars to MapVars and replace uses.
-    auto mapVarsOffset = getBlockMapVarsOffset(targetOp);
-    assert(mapVarsOffset >= hostEvalOffset + targetOp.numHostEvalBlockArgs());
-    for (const unsigned& idx : indicesForAbsorbedToMapVars) {
-      auto hostEvalVar = targetOp.getHostEvalVars()[idx];
+  
+  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
+    auto mapVarsOffset = getMapVarsOffset(op);
+    auto hostEvalOffset = getHostEvalVarsOffset(op);
+    assert(mapVarsOffset >= hostEvalOffset + op.numHostEvalBlockArgs());
+    auto& entryBlock = op.getRegion().front();
+    for (unsigned i = 0; i < op.numHostEvalBlockArgs(); i++) {
+      auto hostEvalVar = op.getHostEvalVars()[i];
       // MapVars only accept ref args
       // hostEvalVar usually type i32, but we need to assert
       assert(hostEvalVar.getType().isInteger());
-      opBuilder.setInsertionPoint(targetOp);
-      auto preAllocaOp = fir::AllocaOp::create(opBuilder, targetOp.getLoc(), hostEvalVar.getType());
-      fir::StoreOp::create(opBuilder, targetOp.getLoc(), hostEvalVar, preAllocaOp.getResult());
+      rewriter.setInsertionPoint(op);
+      auto preAllocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), hostEvalVar.getType());
+      fir::StoreOp::create(rewriter, op.getLoc(), hostEvalVar, preAllocaOp.getResult());
       auto hostEvalVarRef = omp::MapInfoOp::create(
-        opBuilder, 
-        targetOp.getLoc(), 
+        rewriter, 
+        op.getLoc(), 
         preAllocaOp.getType(), 
         preAllocaOp, 
         TypeAttr::get(hostEvalVar.getType()),
-        /*ClauseMapFlagsAttr*/omp::ClauseMapFlagsAttr::get(targetOp.getContext(), ::mlir::omp::ClauseMapFlags::implicit),
-        /*VariableCaptureKindAttr*/omp::VariableCaptureKindAttr::get(targetOp.getContext(), ::mlir::omp::VariableCaptureKind::ByCopy),
+        /*ClauseMapFlagsAttr*/omp::ClauseMapFlagsAttr::get(op.getContext(), ::mlir::omp::ClauseMapFlags::implicit),
+        /*VariableCaptureKindAttr*/omp::VariableCaptureKindAttr::get(op.getContext(), ::mlir::omp::VariableCaptureKind::ByCopy),
         /*opational: var_ptr_ptr*/{},
         /*ValueRange members*/{},
         /*ArrayAttr members_index*/{},
         /*ValueRange bounds*/{},
         /*FlatSymbolRefAttr mapper_id*/{},
-        /*name*/StringAttr::get(targetOp.getContext()),
-        /*partial_map=*/BoolAttr::get(targetOp.getContext(), false)
+        /*name*/StringAttr::get(op.getContext()),
+        /*partial_map=*/BoolAttr::get(op.getContext(), false)
       );
 
-      int insertedArgPosition = mapVarsOffset + targetOp.numMapBlockArgs();
-      auto insertedArg = entryBlock.insertArgument(insertedArgPosition, hostEvalVarRef.getResult().getType(), targetOp.getLoc());
-      targetOp.getMapVarsMutable().append(hostEvalVarRef.getResult());
+      int insertedArgPosition = mapVarsOffset + op.numMapBlockArgs();
+      auto insertedArg = entryBlock.insertArgument(insertedArgPosition, hostEvalVarRef.getResult().getType(), op.getLoc());
+      op.getMapVarsMutable().append(hostEvalVarRef.getResult());
       // recover from fir.ref<i32> to i32 and replace original usage of hostEvalVars
-      opBuilder.setInsertionPointToStart(&entryBlock);
-      auto insertedArgVal = fir::LoadOp::create(opBuilder, targetOp.getLoc(), insertedArg);
-      entryBlock.getArgument(idx + hostEvalOffset).replaceAllUsesWith(insertedArgVal);
-
-      indicesForAbsorbedHostEvalVars.push_back(insertedArgPosition);
+      rewriter.setInsertionPointToStart(&entryBlock);
+      auto insertedArgVal = fir::LoadOp::create(rewriter, op.getLoc(), insertedArg);
+      entryBlock.getArgument(i + hostEvalOffset).replaceAllUsesWith(insertedArgVal);
     }
 
-    for (int i = originalHostEvalVarsCount - 1; i >= 0; i--) {
-      targetOp.getHostEvalVarsMutable().erase(i);
+    for (int i = op.numHostEvalBlockArgs() - 1; i >= 0; i--) {
+      op.getHostEvalVarsMutable().erase(i);
       entryBlock.eraseArgument(hostEvalOffset + i);
-    }
-    for (size_t i = 0; i < indicesForAbsorbedHostEvalVars.size(); i++) {
-      indicesForAbsorbedHostEvalVars[i] -= originalHostEvalVarsCount;
-    }
-  }
-
-
-
-  int getHostEvalOffset(omp::TargetOp op) const {
-    // FIXME: IMPLEMENT ME!
-    return 0;
-  }
-
-  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
-    auto offset = getHostEvalOffset(op);
-    for (int i = 0; i < op.numHostEvalBlockArgs(); i++) {
     }
   }
 };
