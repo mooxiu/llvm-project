@@ -1,12 +1,11 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
-#include "flang/Optimizer/HLFIR/HLFIRDialect.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
-#include "flang/Optimizer/OpenMP/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <alloca.h>
 #include <cassert>
+#include <mlir/Dialect/OpenMP/OpenMPClauseOperands.h>
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
 #include <mlir/IR/Builders.h>
@@ -14,7 +13,7 @@
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/SymbolTable.h>
-#include <variant>
+#include <mlir/Support/WalkResult.h>
 
 namespace flangomp {
   #define GEN_PASS_DEF_FLATTENOPENMPTARGET
@@ -67,15 +66,15 @@ static unsigned getReductionVarsOffset(Operation* wrapper) {
 }
 
 // INFO: Only support private and firstprivate of scalar value.
-// template<typename OMPConstruct> 
-struct MaterializePrivatePattern: public OpRewritePattern<omp::ParallelOp> {
-  using OpRewritePattern<omp::ParallelOp>::OpRewritePattern;
+template<typename T> 
+struct MaterializePrivatePattern: public OpRewritePattern<T> {
+  using OpRewritePattern<T>::OpRewritePattern;
 
-  omp::PrivateClauseOp findPrivateRecipe(omp::ParallelOp op, SymbolRefAttr privateSym) const {
+  omp::PrivateClauseOp findPrivateRecipe(T op, SymbolRefAttr privateSym) const {
     return SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(op, privateSym);
   }
 
-  LogicalResult matchAndRewrite(omp::ParallelOp op, PatternRewriter &rewriter) const {
+  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const {
     auto offset = getPrivateOffset(op);
     if (op.numPrivateBlockArgs() == 0) {
       return failure();
@@ -126,7 +125,9 @@ struct MaterializePrivatePattern: public OpRewritePattern<omp::ParallelOp> {
   };
 };
 
-struct MaterializeReductionPattern: public OpRewritePattern<omp::ParallelOp> {
+struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
+  using OpRewritePattern<omp::LoopOp>::OpRewritePattern;
+
   template<typename T>
   static void replaceLocalReductionVars(T wrapper) {
     auto reductionVarsOffset = getReductionVarsOffset(wrapper);
@@ -170,12 +171,42 @@ struct MaterializeReductionPattern: public OpRewritePattern<omp::ParallelOp> {
       wrapper->removeAttr(wrapper.getReductionSymsAttrName());
     }
   }
+
+
+  omp::ReductionClauseOps getReductionRecipe() {
+    llvm_unreachable("IMPLEMENT ME!");
+  }
+
+  LogicalResult matchAndRewrite(omp::LoopOp op, PatternRewriter &rewriter) const {
+    if (op.numReductionBlockArgs() == 0) {
+      return failure();
+    }
+
+    auto reductionVarOffset = getReductionVarsOffset(op);
+    auto& entryBlock = op.getRegion().getBlocks().front();
+    for (int i = 0; i < op.numReductionBlockArgs(); i++) {
+      auto reductionVar = op.getReductionVars()[i];
+      auto arg =  entryBlock.getArgument(reductionVarOffset + i);
+      
+      auto allocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), arg.getType());
+      auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), reductionVar);
+      fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), allocaOp.getResult());
+
+      rewriter.replaceAllUsesWith(arg, allocaOp.getResult());
+      // TODO: should we store the value back? 
+      // TODO: how should we do with the operation?
+    }
+
+  };
 };
 
 struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
   using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
   
   LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
+    if (op.numHostEvalBlockArgs() == 0) {
+      return failure();
+    };
     auto mapVarsOffset = getMapVarsOffset(op);
     auto hostEvalOffset = getHostEvalVarsOffset(op);
     assert(mapVarsOffset >= hostEvalOffset + op.numHostEvalBlockArgs());
@@ -218,6 +249,7 @@ struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
       op.getHostEvalVarsMutable().erase(i);
       entryBlock.eraseArgument(hostEvalOffset + i);
     }
+    return success();
   }
 };
 
@@ -286,20 +318,15 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
 struct NestedStructurePattern: public OpRewritePattern<omp::TargetOp> {
   using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
 
-  // FIXME: should cover all omp operations with regions.
-  /// Get wrappers ordering from outmost to innermost
   SmallVector<Operation*> getOmpWrappers(omp::TargetOp targetOp) const {
     llvm::SmallVector<Operation*> wrappers;
     // The default order is from innermost to outermost
     targetOp.walk([&](mlir::Operation *op) {
-      if (llvm::isa<mlir::omp::TeamsOp,
-                    mlir::omp::ParallelOp,
-                    mlir::omp::DistributeOp,
-                    mlir::omp::WsloopOp,
-                    mlir::omp::SimdOp
-        >(op)) {
+      if (op->getDialect()->getNamespace() == "omp" && !llvm::isa<omp::TargetOp>(op)) {
         wrappers.push_back(op);
+        WalkResult::advance();
       }
+      WalkResult::skip();
     });
     // reverse so the wrappers is from outtermost to innermost
     std::reverse(wrappers.begin(), wrappers.end());
