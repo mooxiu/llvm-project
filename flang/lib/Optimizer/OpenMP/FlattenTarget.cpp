@@ -1,22 +1,33 @@
+// Regressional Test: 
+
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/OpenMP/Passes.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 #include <alloca.h>
 #include <cassert>
 #include <mlir/Dialect/OpenMP/OpenMPClauseOperands.h>
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
+#include <mlir/Dialect/OpenMP/OpenMPInterfaces.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/SymbolTable.h>
+#include <mlir/Rewrite/FrozenRewritePatternSet.h>
+#include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
+#include <string>
+#include <utility>
 
 namespace flangomp {
   #define GEN_PASS_DEF_FLATTENOPENMPTARGET
@@ -82,10 +93,11 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
       return failure();
     }
 
+    Block& entryBlock = op.getRegion().getBlocks().front();
     OpBuilder::InsertionGuard guard(rewriter);
-    for (int i = 0; i < op.numPrivateBlockArgs(); i++) {
+    for (unsigned i = 0; i < op.numPrivateBlockArgs(); i++) {
       auto privateVar = op.getPrivateVars()[i];
-      auto arg = op->getBlock()->getArgument(offset + i); 
+      auto arg = entryBlock.getArgument(offset + i); 
       
       auto privateSyms = op.getPrivateSyms();
       assert(privateSyms);
@@ -179,7 +191,7 @@ struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
     llvm_unreachable("IMPLEMENT ME!");
   }
 
-  LogicalResult matchAndRewrite(omp::LoopOp op, PatternRewriter &rewriter) const {
+  LogicalResult matchAndRewrite(omp::LoopOp op, PatternRewriter &rewriter) const override {
     if (op.numReductionBlockArgs() == 0) {
       return failure();
     }
@@ -217,7 +229,6 @@ struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
     for (unsigned i = 0; i < op.numHostEvalBlockArgs(); i++) {
       auto hostEvalVar = op.getHostEvalVars()[i];
       // MapVars only accept ref args
-      // hostEvalVar usually type i32, but we need to assert
       assert(hostEvalVar.getType().isInteger());
       rewriter.setInsertionPoint(op);
       auto preAllocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), hostEvalVar.getType());
@@ -256,31 +267,50 @@ struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
   }
 };
 
-struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
-  using OpRewritePattern<omp::LoopNestOp>::OpRewritePattern;
+struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
+  using OpRewritePattern<omp::WsloopOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(omp::LoopNestOp op, PatternRewriter &rewriter) const {
+  static bool isTrivialWsloop(omp::WsloopOp op) {
+    // Operand-based clauses, such as private/reduction/linear.
+    if (op->getNumOperands() != 0)
+      return false;
+    return true;
+  }
+
+  static Value convertToIndexIfNot(Value val, Location loc, PatternRewriter &rewriter) {
+    if (!val.getType().isIndex()) {
+      auto convertOp = fir::ConvertOp::create(rewriter, loc, IndexType::get(rewriter.getContext()), val, {});
+      return convertOp.getResult();
+    }
+    return val;
+  };
+
+  //FIX: should actually translate into something like scf::ParallelOp as wsloop means a prallel execution rather than serial loops.
+  LogicalResult replaceNestLoopOp(
+    omp::LoopNestOp op, 
+    omp::WsloopOp wsOp,
+    PatternRewriter &rewriter
+  ) const {
+    if (!op.getLoopInclusive()) return rewriter.notifyMatchFailure(op, "non-inclusive loop unsupported");
+    if (!op.getRegion().hasOneBlock()) return rewriter.notifyMatchFailure(op, "multi-block loop unsupported");
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    Location loc = op.getLoc();
     fir::DoLoopOp outmostLoopOp = nullptr;
     fir::DoLoopOp lastLoopOp = nullptr;
     llvm::SmallVector<mlir::Value> newInductionVars;
     // from outmost to innermost
     for (uint64_t i = 0; i < op.getCollapseNumLoops(); i ++) {
+      rewriter.setInsertionPoint(wsOp);
+      auto lb = convertToIndexIfNot(op.getLoopLowerBounds()[i], loc, rewriter);
+      auto ub = convertToIndexIfNot(op.getLoopUpperBounds()[i], loc, rewriter);
+      auto step = convertToIndexIfNot(op.getLoopSteps()[i], loc, rewriter);
+
       if (!outmostLoopOp) {
         rewriter.setInsertionPoint(op);
       } else {
         rewriter.setInsertionPointToStart(lastLoopOp.getBody());
       }
-      auto convertToIndexIfNot = [&](Value val) -> Value {
-        if (!val.getType().isIndex()) {
-          auto convertOp = fir::ConvertOp::create(rewriter, op.getLoc(), IndexType::get(rewriter.getContext()), val, {});
-          return convertOp.getResult();
-        }
-        return val;
-      };
-      auto lb = convertToIndexIfNot(op.getLoopLowerBounds()[i]);
-      auto ub = convertToIndexIfNot(op.getLoopUpperBounds()[i]);
-      auto step = convertToIndexIfNot(op.getLoopSteps()[i]);
-
       auto loopOp = fir::DoLoopOp::create(rewriter, op.getLoc(), lb, ub, step);
       if (outmostLoopOp == nullptr) {
         outmostLoopOp = loopOp;
@@ -294,71 +324,108 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
     auto* targetBlock = lastLoopOp.getBody();
     auto* sourceBlock = &op.getRegion().front();
 
-    for (uint64_t i = 0; i < op.getCollapseNumLoops(); i++) {
-      auto loopIV = newInductionVars[i];
-      auto lNOpIV = op.getRegion().front().getArgument(i);
-      if (loopIV.getType() != lNOpIV.getType()) {
-        rewriter.setInsertionPointToStart(lastLoopOp.getBody());
-        auto loopIVConvertOp = fir::ConvertOp::create(rewriter, op.getLoc(), lNOpIV.getType(), loopIV, {});
-        loopIV = loopIVConvertOp.getResult();
-      }
-      sourceBlock->getArgument(i).replaceAllUsesWith(loopIV);
-    }
+    rewriter.eraseOp(sourceBlock->getTerminator());
 
-    mlir::Block::iterator insertPt(targetBlock->getTerminator());
-    targetBlock->getOperations().splice(
-      insertPt,
-      sourceBlock->getOperations(),
-      sourceBlock->getOperations().begin(),
-      std::prev(sourceBlock->getOperations().end()) 
-    );
+    rewriter.inlineBlockBefore(
+        sourceBlock,
+        targetBlock,
+        targetBlock->getTerminator()->getIterator(),
+        newInductionVars);
+
     rewriter.eraseOp(op);
     assert(outmostLoopOp);
     return success();
   }
+
+  LogicalResult matchAndRewrite(omp::WsloopOp op, PatternRewriter &rewriter) const {
+    if (llvm::isa<omp::DistributeOp, omp::TeamsOp>(op->getParentOp())) {
+      return failure();
+    }
+    assert(op.getRegion().hasOneBlock());
+    auto& block = op.getRegion().getBlocks().front();
+    assert(block.getOperations().size() == 1);
+    Operation& firstOp = block.getOperations().front();
+    llvm::DenseSet<StringRef> transformedNamespaces = {"scf", "fir"};
+
+    if (auto nestLoopOp = llvm::dyn_cast<omp::LoopNestOp>(&firstOp)) {
+      auto res = replaceNestLoopOp(nestLoopOp, op, rewriter);
+      if (res.failed()) {
+        return failure();
+      }
+    } else if (transformedNamespaces.contains(firstOp.getDialect()->getNamespace())) {
+      return failure();
+    } else {
+      llvm::errs() << "\nUnexpected Operation: ";
+      firstOp.dump();
+      return failure();
+    }
+
+    if (isTrivialWsloop(op)) {
+      rewriter.inlineBlockBefore(
+        &block,
+        op->getBlock(),
+        op->getIterator()
+      );
+      rewriter.eraseOp(op);
+      return success();
+    }
+    return failure();
+  }
 };
 
-struct NestedStructurePattern: public OpRewritePattern<omp::TargetOp> {
-  using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
+template<typename T>
+struct NestedStructurePattern: public OpRewritePattern<T> {
+  using OpRewritePattern<T>::OpRewritePattern;
+  
+  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const {
+    if (!op) {
+      return failure();
+    }
+    if (op.getNumOperands() > 0) {
+      return failure();
+    }
+    if (!op.getRegion().hasOneBlock()) {
+      return failure();
+    }
+    if (op->getDialect()->getNamespace()!="omp") {
+      return failure();
+    }
 
-  SmallVector<Operation*> getOmpWrappers(omp::TargetOp targetOp) const {
-    llvm::SmallVector<Operation*> wrappers;
-    // The default order is from innermost to outermost
-    targetOp.walk([&](mlir::Operation *op) {
-      if (op->getDialect()->getNamespace() == "omp" && !llvm::isa<omp::TargetOp>(op)) {
-        wrappers.push_back(op);
-        WalkResult::advance();
-      }
-      WalkResult::skip();
-    });
-    // reverse so the wrappers is from outtermost to innermost
-    std::reverse(wrappers.begin(), wrappers.end());
-    return wrappers;
-  }
+    Operation* parentOp = op->getParentOp();
+    auto* parentBlock = op->getBlock();
+    auto& innerBlock = op.getRegion().getBlocks().front(); 
+    if (!innerBlock.empty() && innerBlock.back().template hasTrait<mlir::OpTrait::IsTerminator>()) {
+      rewriter.eraseOp(&innerBlock.back());
+    }
+    rewriter.inlineBlockBefore(
+      &innerBlock, 
+      parentBlock,
+      op->getIterator()
+    );
+    rewriter.eraseOp(op);
 
-  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
-    auto wrappers = getOmpWrappers(op);
-    if (wrappers.empty()) return failure();
-    for (size_t i = 0; i < wrappers.size(); i++) {
-      auto* wrapper = wrappers[i]; 
-      if (wrapper->getNumRegions() == 0 || wrapper->getRegion(0).empty()) {
-        continue;
-      }
-      mlir::Block *parentBlock = wrapper->getBlock();
-      mlir::Block *innerBlock = &wrapper->getRegion(0).front();
-      auto &innerOps = innerBlock->getOperations();
-      mlir::Block::iterator insertPt(wrapper);
-      auto insertEnd = innerOps.end();
-      if (!innerOps.empty() && innerOps.back().hasTrait<OpTrait::IsTerminator>()) {
-        insertEnd = mlir::Block::iterator(&innerOps.back());
-      }
-      parentBlock->getOperations().splice(
-        insertPt,
-        innerOps,
-        innerOps.begin(),
-        insertEnd
-      );
-      wrapper->erase();
+    // Delete omp.composite if necessary
+    if (!parentOp->getDiscardableAttr("omp.composite")) {
+      return success();
+    }
+    auto stillContainsLoopWrapper = [&](Operation* op) -> bool {
+      bool contains = false;; 
+      op->walk([&](Operation* subOp){
+        if (subOp->getDialect()->getNamespace() != "omp") {
+          return WalkResult::skip();
+        }
+        if (isa<omp::LoopWrapperInterface>(op->getParentOp())) {
+          contains = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::skip();
+      });
+      return contains;
+    }; 
+    if (!stillContainsLoopWrapper(parentOp)) {
+      rewriter.modifyOpInPlace(parentOp, [&]{
+        parentOp->removeDiscardableAttr("omp.composite");
+      });
     }
     return success();
   }
@@ -373,6 +440,10 @@ public:
 
     RewritePatternSet patterns(ctx);
     patterns.add<MaterializePrivatePattern<omp::ParallelOp>>(ctx);
+    patterns.add<MapHostEvalPattern>(ctx);
+    patterns.add<ReplaceLoopPattern>(ctx);
+    patterns.add<NestedStructurePattern<omp::ParallelOp>>(ctx);
+    patterns.add<NestedStructurePattern<omp::DistributeOp>>(ctx);
     GreedyRewriteConfig config;
     config.enableFolding();
 
@@ -381,6 +452,15 @@ public:
       signalPassFailure();
       return;
     }
+    //
+    // RewritePatternSet deNestPatterns(ctx);
+    // deNestPatterns.add<NestedStructurePattern>(ctx);
+    // FrozenRewritePatternSet deNestPatternSet(std::move(deNestPatterns));
+    // if (failed(applyPatternsGreedily(moduleOp, deNestPatternSet, config))) {
+    //   signalPassFailure();
+    //   return;
+    // }
+
     return;
   };
 };
