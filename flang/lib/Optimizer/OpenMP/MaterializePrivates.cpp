@@ -6,6 +6,7 @@
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 namespace flangomp {
   #define GEN_PASS_DEF_MATERIALIZEPRIVATES
@@ -79,9 +80,23 @@ class MaterializePrivatesPass
   : public flangomp::impl::MaterializePrivatesBase<MaterializePrivatesPass> {
 public:
   void runOnOperation() override {
-      
+    ModuleOp moduleOp = getOperation();
+    MLIRContext *ctx = moduleOp->getContext();
+    OpBuilder opBuilder(ctx);
+
+    RewritePatternSet patterns(ctx);
+    patterns.add<MaterializeImplicitPrivatesPattern>(ctx);
+    GreedyRewriteConfig config;
+    config.enableFolding();
+
+    FrozenRewritePatternSet frozenRewritePatternSet(std::move(patterns));
+    if (failed(applyPatternsGreedily(moduleOp, frozenRewritePatternSet, config))) {
+      signalPassFailure();
+      return;
+    }
+    return; 
   }
 };
-}
+} // namespace
 
 

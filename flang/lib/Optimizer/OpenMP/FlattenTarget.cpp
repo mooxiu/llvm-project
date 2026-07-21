@@ -1,5 +1,6 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
+#include "flang/Optimizer/OpenMP/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -10,10 +11,12 @@
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/SymbolTable.h>
 #include <mlir/Support/WalkResult.h>
+#include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 namespace flangomp {
   #define GEN_PASS_DEF_FLATTENOPENMPTARGET
@@ -25,7 +28,6 @@ namespace flangomp {
 using namespace mlir;
 
 namespace {
-
 static unsigned getPrivateOffset(Operation* wrapper) {
   return 0;
 }
@@ -195,6 +197,7 @@ struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
       rewriter.replaceAllUsesWith(arg, allocaOp.getResult());
       // TODO: should we store the value back? 
       // TODO: how should we do with the operation?
+      // FIXME: Implement me!
     }
 
   };
@@ -361,13 +364,27 @@ struct NestedStructurePattern: public OpRewritePattern<omp::TargetOp> {
   }
 };
 
-
 class FlattenTargetPass : public flangomp::impl::FlattenOpenMPTargetBase<FlattenTargetPass> {
 public:
   void runOnOperation() override {
-    return;   
+    ModuleOp moduleOp = getOperation();
+    MLIRContext *ctx = moduleOp->getContext();
+    OpBuilder opBuilder(ctx);
+
+    RewritePatternSet patterns(ctx);
+    patterns.add<MaterializePrivatePattern<omp::ParallelOp>>(ctx);
+    GreedyRewriteConfig config;
+    config.enableFolding();
+
+    FrozenRewritePatternSet frozenRewritePatternSet(std::move(patterns));
+    if (failed(applyPatternsGreedily(moduleOp, frozenRewritePatternSet, config))) {
+      signalPassFailure();
+      return;
+    }
+    return;
   };
 };
+
 }// namespace
 
 
