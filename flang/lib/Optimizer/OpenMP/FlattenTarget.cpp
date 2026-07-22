@@ -113,7 +113,7 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
       auto kind = recipe.getDataSharingType();
       Type type = recipe.getType();
       // materializePrivate(kind, type, privateVar, arg);
-      // FIXME: should use recipe, kind and type
+      // FIXME: should use recipe, kind and type, but only consider scalar for now
       rewriter.setInsertionPointToStart(op->getBlock());      
       auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), privateVar);
       auto local = fir::AllocaOp::create(rewriter, op.getLoc(), type);
@@ -442,8 +442,10 @@ public:
     patterns.add<MaterializePrivatePattern<omp::ParallelOp>>(ctx);
     patterns.add<MapHostEvalPattern>(ctx);
     patterns.add<ReplaceLoopPattern>(ctx);
+    patterns.add<NestedStructurePattern<omp::WsloopOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::ParallelOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::DistributeOp>>(ctx);
+    patterns.add<NestedStructurePattern<omp::TeamsOp>>(ctx);
     GreedyRewriteConfig config;
     config.enableFolding();
 
