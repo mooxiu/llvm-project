@@ -10,6 +10,7 @@
 /// common to flang and the test tools.
 
 #include "flang/Optimizer/Passes/Pipelines.h"
+#include "flang/Optimizer/OpenMP/Passes.h"
 #include "llvm/Support/CommandLine.h"
 
 /// Force setting the no-alias attribute on fuction arguments when possible.
@@ -271,6 +272,8 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
                                   const MLIRToLLVMPassPipelineConfig &config) {
   llvm::OptimizationLevel optLevel = config.OptLevel;
   if (jitWorkdistribute) {
+    pm.addPass(flangomp::createMaterializePrivates());
+    pm.addPass(flangomp::createFlattenOpenMPTarget());
     pm.addPass(flangomp::createLowerWorkdistributeToJit());
   }
 

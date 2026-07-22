@@ -1,4 +1,4 @@
-// Regressional Test: 
+// Regressional Test: flang/test/Transforms/OpenMP/flatten-target.mlir
 
 #include "flang/Optimizer/Dialect/FIROps.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
@@ -8,7 +8,6 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/raw_ostream.h"
 #include <alloca.h>
 #include <cassert>
 #include <mlir/Dialect/OpenMP/OpenMPClauseOperands.h>
@@ -26,7 +25,6 @@
 #include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
-#include <string>
 #include <utility>
 
 namespace flangomp {
@@ -326,7 +324,8 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
   LogicalResult replaceNestLoopOp(
     omp::LoopNestOp op, 
     Operation* wrapper,
-    PatternRewriter &rewriter
+    PatternRewriter &rewriter,
+    bool isParalleled
   ) const {
     if (!op.getLoopInclusive()) return rewriter.notifyMatchFailure(op, "non-inclusive loop unsupported");
     if (!op.getRegion().hasOneBlock()) return rewriter.notifyMatchFailure(op, "multi-block loop unsupported");
@@ -335,9 +334,11 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
     Operation* container = wrapper -> getParentOp(); // container like omp::team, need to discard composite
 
     Location loc = op.getLoc();
+    llvm::SmallVector<mlir::Value> newInductionVars;
+
+    // TODO: if (!isParalleled) {
     fir::DoLoopOp outmostLoopOp = nullptr;
     fir::DoLoopOp lastLoopOp = nullptr;
-    llvm::SmallVector<mlir::Value> newInductionVars;
     // from outmost to innermost
     for (uint64_t i = 0; i < op.getCollapseNumLoops(); i ++) {
       rewriter.setInsertionPoint(wrapper);
@@ -391,7 +392,15 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
         return rewriter.notifyMatchFailure(op, "unsupported loop wrapper");
     }
     Operation* outmostWrapper = wrappers.back().getOperation();
-    return replaceNestLoopOp(op, outmostWrapper, rewriter);
+    bool isParalleled = [&](void) -> bool {
+      for (const auto wrapper: wrappers) {
+        if (llvm::isa<omp::WsloopOp>(wrapper)) {
+          return true;
+        }
+      }
+      return false;
+    }();
+    return replaceNestLoopOp(op, outmostWrapper, rewriter, isParalleled);
   }
 };
 
