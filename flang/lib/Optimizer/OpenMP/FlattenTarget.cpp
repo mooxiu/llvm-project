@@ -8,8 +8,10 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 #include <alloca.h>
 #include <cassert>
+#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/OpenMP/OpenMPClauseOperands.h>
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
 #include <mlir/Dialect/OpenMP/OpenMPInterfaces.h>
@@ -25,6 +27,7 @@
 #include <mlir/Support/LLVM.h>
 #include <mlir/Support/WalkResult.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
+#include <optional>
 #include <utility>
 
 namespace flangomp {
@@ -48,6 +51,7 @@ namespace {
 // omp::SimdOp
 
 static unsigned getPrivateOffset(Operation* wrapper) {
+  // FIX: IMPLEMENT ME
   return 0;
 }
 
@@ -84,6 +88,36 @@ static unsigned getReductionVarsOffset(Operation* wrapper) {
     .Default([&](Operation*) -> unsigned{
       llvm_unreachable("unexpected operation for getting reduction vars offset!");
     });
+}
+
+static mlir::Type unwrapElementType(mlir::Type type) {
+  while (true) {
+    if (auto refTy = llvm::dyn_cast<fir::ReferenceType>(type)) {
+      type = refTy.getEleTy();
+      continue;
+    }
+    if (auto ptrTy = llvm::dyn_cast<fir::PointerType>(type)) {
+      type = ptrTy.getEleTy();
+      continue;
+    }
+    if (auto heapTy = llvm::dyn_cast<fir::HeapType>(type)) {
+      type = heapTy.getEleTy();
+      continue;
+    }
+    if (auto boxTy = llvm::dyn_cast<fir::BaseBoxType>(type)) {
+      type = boxTy.getEleTy();
+      continue;
+    }
+    if (auto seqTy = llvm::dyn_cast<fir::SequenceType>(type)) {
+      type = seqTy.getEleTy();
+      continue;
+    }
+    if (auto shapedTy = llvm::dyn_cast<mlir::ShapedType>(type)) {
+      type = shapedTy.getElementType();
+      continue;
+    }
+    return type;
+  }
 }
 
 // INFO: Only support private and firstprivate of scalar value.
@@ -149,81 +183,164 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
   };
 };
 
-struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
-  using OpRewritePattern<omp::LoopOp>::OpRewritePattern;
+template <typename T> 
+static omp::DeclareReductionOp findReductionRecipe(T op, unsigned index) {
+  std::optional<ArrayAttr> syms = op.getReductionSyms();
+  assert(syms);
+  assert(index < syms->size());
+  auto symbol = cast<SymbolRefAttr>((*syms)[index]);
+  return SymbolTable::lookupNearestSymbolFrom<
+      omp::DeclareReductionOp>(op.getOperation(), symbol);
+}
 
-  template<typename T>
-  static void replaceLocalReductionVars(T wrapper) {
-    auto reductionVarsOffset = getReductionVarsOffset(wrapper);
-    auto& entryBlock = wrapper.getRegion().front();
+static Value getInitializedValue(omp::DeclareReductionOp recipe, PatternRewriter& rewriter) {
+  auto& initRegion = recipe.getInitializerRegion();
+  Block &initBlock = initRegion.front();
 
-    int reductionVarsCount = wrapper.numReductionBlockArgs();
-    assert(wrapper.getReductionVars().size() == size_t(reductionVarsCount));
+  auto initYield = dyn_cast<omp::YieldOp>(initBlock.getTerminator());
 
-
-    llvm::DenseSet<Operation*> toErase;
-    for (int i = 0; i < reductionVarsCount; i++) {
-      Value reductionVarArg = entryBlock.getArgument(reductionVarsOffset + i);
-      Value reductionVar = wrapper.getReductionVars()[i];
-
-      for (auto* user: reductionVarArg.getUsers()) {
-        if (auto declaredOp = llvm::dyn_cast<hlfir::DeclareOp>(user)) {
-          assert(declaredOp.getMemref() == reductionVarArg);
-          declaredOp.getResult(0).replaceAllUsesWith(reductionVar);
-          if (declaredOp.getNumResults() > 1) {
-            assert(declaredOp.getNumResults() == 2);
-            assert(declaredOp.getResult(1).use_empty());
-          }
-          assert(declaredOp.use_empty());
-          toErase.insert(declaredOp);
-        }    
-      }
-      reductionVarArg.replaceAllUsesWith(reductionVar);
-      assert(reductionVarArg.use_empty());
-    }
-
-    llvm::for_each(toErase, [](Operation* op){op->erase();});
-
-    for (int i = reductionVarsCount - 1; i >= 0; i--) {
-      entryBlock.eraseArgument(reductionVarsOffset + i);
-      wrapper.getReductionVarsMutable().erase(i);
-    }
-
-    assert(wrapper.getReductionVars().empty());
-
-    if (wrapper->hasAttr(wrapper.getReductionSymsAttrName())) {
-      wrapper->removeAttr(wrapper.getReductionSymsAttrName());
-    }
+  if (!initYield || initYield->getNumOperands() != 1 ||
+      !llvm::hasSingleElement(initBlock.without_terminator())) {
+    return nullptr;
   }
 
+  Value initializedValue = initYield.getOperand(0);
+  auto initializer = initializedValue.getDefiningOp<arith::ConstantOp>();
+  assert(initializer);
+  Operation *cloned =
+      rewriter.clone(*initializer.getOperation());
+  return cloned->getResult(0);
+  return initializedValue;
+}
 
-  omp::ReductionClauseOps getReductionRecipe() {
-    llvm_unreachable("IMPLEMENT ME!");
+
+static std::optional<arith::AtomicRMWKind> classifyCombiner(Operation* op) {
+  if (llvm::isa<arith::AddIOp>(op)) return arith::AtomicRMWKind::addi;
+  if (llvm::isa<arith::AddFOp>(op)) return arith::AtomicRMWKind::addf;
+  if (llvm::isa<arith::MulIOp>(op)) return arith::AtomicRMWKind::muli;
+  if (llvm::isa<arith::MulFOp>(op)) return arith::AtomicRMWKind::mulf;
+  if (llvm::isa<arith::MaxNumFOp>(op)) return arith::AtomicRMWKind::maxnumf;
+  if (llvm::isa<arith::MinNumFOp>(op)) return arith::AtomicRMWKind::minnumf;
+  llvm::errs() << "\nUnexpected Reduction Combiner: ";
+  op->dump(); 
+  return std::nullopt;
+}
+
+// TODO: in fact it reduce can accept complicated reductions, but we're only going to accept Add, Mul, MAXF, MINF
+// Can be expanded but also need to expand Enzyme-JAX.
+static std::optional<arith::AtomicRMWKind> getCombiner(omp::DeclareReductionOp recipe) {
+  auto& reductionRegion = recipe.getReductionRegion();
+  Block &reductionBlock = reductionRegion.front();
+
+  auto reductionYield = dyn_cast<omp::YieldOp>(reductionBlock.getTerminator());
+
+  if (!reductionYield ||
+      reductionYield->getNumOperands() != 1 ||
+      reductionBlock.getNumArguments() != 2 ||
+      !llvm::hasSingleElement(
+          reductionBlock.without_terminator())) {
+    return std::nullopt;
   }
 
-  LogicalResult matchAndRewrite(omp::LoopOp op, PatternRewriter &rewriter) const override {
-    if (op.numReductionBlockArgs() == 0) {
+  Operation *combiner = reductionYield.getOperand(0).getDefiningOp();
+
+  if (!combiner ||
+      combiner->getNumOperands() != 2 ||
+      combiner->getNumResults() != 1 ||
+      combiner->getOperand(0) !=
+          reductionBlock.getArgument(0) ||
+      combiner->getOperand(1) !=
+          reductionBlock.getArgument(1))
+    return std::nullopt;
+
+  return classifyCombiner(combiner);
+}
+
+
+static Value combineReduction(
+  arith::AtomicRMWKind kind, 
+  Value localAcc, 
+  Value globalAcc,
+  Location loc,
+  PatternRewriter& rewriter 
+) {
+  if (kind == arith::AtomicRMWKind::addi) {
+    return arith::AddIOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  if (kind == arith::AtomicRMWKind::addf) {
+    return arith::AddFOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  if (kind == arith::AtomicRMWKind::muli) {
+    return arith::MulIOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  if (kind == arith::AtomicRMWKind::mulf) {
+    return arith::MulFOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  if (kind == arith::AtomicRMWKind::maxnumf) {
+    return arith::MaxNumFOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  if (kind == arith::AtomicRMWKind::minnumf) {
+    return arith::MinNumFOp::create(rewriter, loc, localAcc, globalAcc).getResult();
+  }
+  llvm_unreachable("unexpected kind");
+}
+
+template<typename T>
+struct MaterializeSerialReducePattern : public OpRewritePattern<T> {
+  using OpRewritePattern<T>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const override {
+    if (op.getNumReductionVars() == 0) {
       return failure();
     }
 
-    auto reductionVarOffset = getReductionVarsOffset(op);
-    auto& entryBlock = op.getRegion().getBlocks().front();
-    for (unsigned i = 0; i < op.numReductionBlockArgs(); i++) {
-      auto reductionVar = op.getReductionVars()[i];
-      auto arg =  entryBlock.getArgument(reductionVarOffset + i);
-      
-      auto allocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), arg.getType());
-      auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), reductionVar);
-      fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), allocaOp.getResult());
+    Block& entryBlock = op.getRegion().getBlocks().front(); 
+    auto reductionOffset = getReductionVarsOffset(op); 
+    for (unsigned i = 0; i < op.getNumReductionVars(); i++) {
+      omp::DeclareReductionOp recipe = findReductionRecipe(op, i);
+      assert(recipe);
 
-      rewriter.replaceAllUsesWith(arg, allocaOp.getResult());
-      // TODO: should we store the value back? 
-      // TODO: how should we do with the operation?
-      // FIXME: Implement me!
+      auto reduceVar = op.getReductionVars()[i];
+      auto reduceArg = op.getRegion().front().getArgument(i + reductionOffset);
+    
+      rewriter.setInsertionPointToStart(&entryBlock);
+      auto reduceAccType = unwrapElementType(reduceArg.getType());
+      assert(reduceAccType.isIntOrFloat());
+      auto alloca = fir::AllocaOp::create(rewriter, op.getLoc(), reduceAccType);
+      auto initVal = getInitializedValue(recipe, rewriter);
+      fir::StoreOp::create(rewriter, op.getLoc(), initVal, alloca);
+      rewriter.replaceAllUsesWith(reduceArg, alloca.getResult());
+
+      if (entryBlock.mightHaveTerminator()) {
+        if (entryBlock.getTerminator()) {
+          rewriter.setInsertionPoint(entryBlock.getTerminator());
+        } else {
+          rewriter.setInsertionPointToEnd(&entryBlock);
+        }
+      } else {
+        rewriter.setInsertionPointToEnd(&entryBlock);
+      }
+      auto localAcc = fir::LoadOp::create(rewriter, op.getLoc(), alloca.getResult()).getResult();
+      auto globalAcc = fir::LoadOp::create(rewriter, op.getLoc(), reduceVar).getResult();
+      assert(getCombiner(recipe).has_value());
+      auto kind = getCombiner(recipe).value();
+      auto res = combineReduction(kind, localAcc, globalAcc, op.getLoc(), rewriter);
+      fir::StoreOp::create(rewriter, op.getLoc(), res, reduceVar);
     }
-
-    return failure();
-  };
+    for (int i = op.getNumReductionVars() - 1; i >= 0; i--) {
+      rewriter.modifyOpInPlace(op, [&]{
+        if (op->hasAttr(op.getReductionSymsAttrName())) {
+          op->removeAttr(op.getReductionSymsAttrName());
+        }
+        if (op->hasAttr(op.getReductionByrefAttrName())) {
+          op->removeAttr(op.getReductionByrefAttrName());
+        }
+        op.getReductionVarsMutable().erase(i);
+        entryBlock.eraseArgument(reductionOffset + i);
+      });
+    }
+    return success();
+  }
 };
 
 struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
@@ -493,7 +610,11 @@ public:
     MLIRContext *ctx = moduleOp->getContext();
     OpBuilder opBuilder(ctx);
 
+    //FIXME: use scf::ParallelOp instead of fir::DoLoop for wsLoopOp
+    //Also, for scf::ParallelOp, use scf::ReduceOp instead of non-atomic operations
     RewritePatternSet patterns(ctx);
+    patterns.add<MaterializeSerialReducePattern<omp::TeamsOp>>(ctx);
+    patterns.add<MaterializeSerialReducePattern<omp::WsloopOp>>(ctx);
     patterns.add<MaterializePrivatePattern<omp::ParallelOp>>(ctx);
     patterns.add<MapHostEvalPattern>(ctx);
     patterns.add<ReplaceLoopPattern>(ctx);
