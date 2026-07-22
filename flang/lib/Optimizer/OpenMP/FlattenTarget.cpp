@@ -87,7 +87,7 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
     return SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(op, privateSym);
   }
 
-  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const {
+  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const override {
     auto offset = getPrivateOffset(op);
     if (op.numPrivateBlockArgs() == 0) {
       return failure();
@@ -114,7 +114,7 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
       Type type = recipe.getType();
       // materializePrivate(kind, type, privateVar, arg);
       // FIXME: should use recipe, kind and type, but only consider scalar for now
-      rewriter.setInsertionPointToStart(op->getBlock());      
+      rewriter.setInsertionPointToStart(&entryBlock);      
       auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), privateVar);
       auto local = fir::AllocaOp::create(rewriter, op.getLoc(), type);
       fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), local.getResult());
@@ -123,17 +123,19 @@ struct MaterializePrivatePattern: public OpRewritePattern<T> {
 
     // erase
     for (int i = op.numPrivateBlockArgs() - 1; i >= 0; i--) {
-      op.getPrivateVarsMutable().erase(i);
-      if (auto syms = op.getPrivateSyms()) {
-        llvm::SmallVector<mlir::Attribute> newSyms(syms->getValue());
-        newSyms.erase(newSyms.begin() + i);
-        if (newSyms.empty()) {
-          op.removePrivateSymsAttr();
-      } else {
-          op.setPrivateSymsAttr(rewriter.getArrayAttr(newSyms));
+      rewriter.modifyOpInPlace(op, [&]{
+        op.getPrivateVarsMutable().erase(i);
+        if (auto syms = op.getPrivateSyms()) {
+          llvm::SmallVector<mlir::Attribute> newSyms(syms->getValue());
+          newSyms.erase(newSyms.begin() + i);
+          if (newSyms.empty()) {
+            op.removePrivateSymsAttr();
+        } else {
+            op.setPrivateSymsAttr(rewriter.getArrayAttr(newSyms));
+          }
         }
-      }
-      op.getRegion().front().eraseArgument(offset + i);
+        op.getRegion().front().eraseArgument(offset + i);
+      });
     }
     return success();
   };
@@ -198,7 +200,7 @@ struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
 
     auto reductionVarOffset = getReductionVarsOffset(op);
     auto& entryBlock = op.getRegion().getBlocks().front();
-    for (int i = 0; i < op.numReductionBlockArgs(); i++) {
+    for (unsigned i = 0; i < op.numReductionBlockArgs(); i++) {
       auto reductionVar = op.getReductionVars()[i];
       auto arg =  entryBlock.getArgument(reductionVarOffset + i);
       
@@ -212,13 +214,14 @@ struct MaterializeReductionPattern: public OpRewritePattern<omp::LoopOp> {
       // FIXME: Implement me!
     }
 
+    return failure();
   };
 };
 
 struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
   using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
   
-  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
+  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const override {
     if (op.numHostEvalBlockArgs() == 0) {
       return failure();
     };
@@ -337,7 +340,7 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
     return success();
   }
 
-  LogicalResult matchAndRewrite(omp::WsloopOp op, PatternRewriter &rewriter) const {
+  LogicalResult matchAndRewrite(omp::WsloopOp op, PatternRewriter &rewriter) const override {
     if (llvm::isa<omp::DistributeOp, omp::TeamsOp>(op->getParentOp())) {
       return failure();
     }
@@ -373,11 +376,27 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
   }
 };
 
+
+// Remove current omp wrapper: moving content to parent block
+// precondition: this should be from innermost to outter most, there should be no other omp wrapper inside of it
 template<typename T>
 struct NestedStructurePattern: public OpRewritePattern<T> {
   using OpRewritePattern<T>::OpRewritePattern;
   
-  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const {
+  bool noOtherOmpWrapperInside(T op) const {
+    Block& b = op.getRegion().getBlocks().front();
+    auto hasAnotherOmpWrapper = false;
+    b.walk([&](Operation* subOp){
+      if (subOp->getDialect()->getNamespace() == "omp") {
+        hasAnotherOmpWrapper = true;
+        WalkResult::interrupt();
+      }
+      WalkResult::advance();
+    });
+    return hasAnotherOmpWrapper;
+  }
+
+  LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const override{
     if (!op) {
       return failure();
     }
@@ -388,6 +407,9 @@ struct NestedStructurePattern: public OpRewritePattern<T> {
       return failure();
     }
     if (op->getDialect()->getNamespace()!="omp") {
+      return failure();
+    }
+    if (!noOtherOmpWrapperInside(op)) {
       return failure();
     }
 
@@ -442,7 +464,6 @@ public:
     patterns.add<MaterializePrivatePattern<omp::ParallelOp>>(ctx);
     patterns.add<MapHostEvalPattern>(ctx);
     patterns.add<ReplaceLoopPattern>(ctx);
-    patterns.add<NestedStructurePattern<omp::WsloopOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::ParallelOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::DistributeOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::TeamsOp>>(ctx);

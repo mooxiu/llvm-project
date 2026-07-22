@@ -73,8 +73,11 @@ func.func private @_QFPrun_benchmark(%arg0: !fir.ref<!fir.array<?xf64>> {fir.bin
 // SL-ASSIGN-NOT: host_eval
 // SL-ASSIGN-SAME: map_entries
 // SL-ASSIGN-NOT: private(
+// SL-ASSIGN-NOT: omp.teams
+// SL-ASSIGN-NOT: omp.parallel
+// SL-ASSIGN-NOT: omp.distribute
+// SL-ASSIGN-NOT: omp.wsloop
 // SL-ASSIGN-NOT: omp.loop_nest
-// SL-ASSIGN-NOT: omp.
   omp.target host_eval(%c1_i32 -> %arg3, %20 -> %arg4, %c1_i32_1 -> %arg5 : i32, i32, i32) map_entries(%21 -> %arg6, %22 -> %arg7, %25 -> %arg8, %28 -> %arg9, %29 -> %arg10, %30 -> %arg11 : !fir.ref<i32>, !fir.ref<i32>, !fir.ref<!fir.array<?xf64>>, !fir.ref<!fir.array<?xf64>>, !fir.ref<i32>, !fir.ref<i32>) {
     %31 = fir.load %arg11 : !fir.ref<i32>
     %32 = fir.load %arg10 : !fir.ref<i32>
