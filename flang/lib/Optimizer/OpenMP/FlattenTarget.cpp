@@ -39,6 +39,16 @@ namespace flangomp {
 using namespace mlir;
 
 namespace {
+// We're going to deal with:
+// omp::TargetOp,
+// omp::TeamsOp,
+// omp::DistributeOp,
+// omp::ParallelOp,
+// omp::WsloopOp,
+// omp::LoopNestOp,
+// omp::LoopOp
+// omp::SimdOp
+
 static unsigned getPrivateOffset(Operation* wrapper) {
   return 0;
 }
@@ -270,13 +280,37 @@ struct MapHostEvalPattern: public OpRewritePattern<omp::TargetOp> {
   }
 };
 
-struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
-  using OpRewritePattern<omp::WsloopOp>::OpRewritePattern;
+// Replace the omp::WsloopOp.
+// Preconditions:
+// - We need to repalce the whole chain (LoopWrapperInterface) to prevent generating illegal IR.
+// - Wrappers include loop, simd, distribute, wsloop, their semantics will be replaced by XLA's schedular.
+// - We need to ensure wrappers do not contain clauses like private or reduction.
+struct ReplaceLoopPattern: public OpRewritePattern<omp::LoopNestOp> {
+  using OpRewritePattern<omp::LoopNestOp>::OpRewritePattern;
 
-  static bool isTrivialWsloop(omp::WsloopOp op) {
-    // Operand-based clauses, such as private/reduction/linear.
+  static bool isSupportedLoopWrapper(omp::LoopWrapperInterface wrapper) {
+    Operation *op = wrapper.getOperation();
+    if (!isa<omp::DistributeOp, omp::WsloopOp, omp::LoopOp, omp::SimdOp>(op))
+      return false;
+
     if (op->getNumOperands() != 0)
       return false;
+
+    Region &region = op->getRegion(0);
+    if (!region.hasOneBlock() ||
+        region.front().getNumArguments() != 0)
+      return false;
+
+    for (NamedAttribute attr : op->getAttrs()) {
+      StringRef name = attr.getName().strref();
+
+      if (name == "omp.composite" ||
+          name == "operandSegmentSizes" ||
+          name == "operand_segment_sizes")
+        continue;
+      return false;
+    }
+
     return true;
   }
 
@@ -291,26 +325,28 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
   //FIX: should actually translate into something like scf::ParallelOp as wsloop means a prallel execution rather than serial loops.
   LogicalResult replaceNestLoopOp(
     omp::LoopNestOp op, 
-    omp::WsloopOp wsOp,
+    Operation* wrapper,
     PatternRewriter &rewriter
   ) const {
     if (!op.getLoopInclusive()) return rewriter.notifyMatchFailure(op, "non-inclusive loop unsupported");
     if (!op.getRegion().hasOneBlock()) return rewriter.notifyMatchFailure(op, "multi-block loop unsupported");
 
     OpBuilder::InsertionGuard guard(rewriter);
+    Operation* container = wrapper -> getParentOp(); // container like omp::team, need to discard composite
+
     Location loc = op.getLoc();
     fir::DoLoopOp outmostLoopOp = nullptr;
     fir::DoLoopOp lastLoopOp = nullptr;
     llvm::SmallVector<mlir::Value> newInductionVars;
     // from outmost to innermost
     for (uint64_t i = 0; i < op.getCollapseNumLoops(); i ++) {
-      rewriter.setInsertionPoint(wsOp);
+      rewriter.setInsertionPoint(wrapper);
       auto lb = convertToIndexIfNot(op.getLoopLowerBounds()[i], loc, rewriter);
       auto ub = convertToIndexIfNot(op.getLoopUpperBounds()[i], loc, rewriter);
       auto step = convertToIndexIfNot(op.getLoopSteps()[i], loc, rewriter);
 
       if (!outmostLoopOp) {
-        rewriter.setInsertionPoint(op);
+        rewriter.setInsertionPoint(wrapper);
       } else {
         rewriter.setInsertionPointToStart(lastLoopOp.getBody());
       }
@@ -335,44 +371,27 @@ struct ReplaceLoopPattern: public OpRewritePattern<omp::WsloopOp> {
         targetBlock->getTerminator()->getIterator(),
         newInductionVars);
 
-    rewriter.eraseOp(op);
-    assert(outmostLoopOp);
+    rewriter.eraseOp(wrapper);
+    if (container && container->getDiscardableAttr("omp.composite")) {
+      rewriter.modifyOpInPlace(container, [&]{
+        container->removeDiscardableAttr("omp.composite");
+      });
+    }
     return success();
   }
 
-  LogicalResult matchAndRewrite(omp::WsloopOp op, PatternRewriter &rewriter) const override {
-    if (llvm::isa<omp::DistributeOp, omp::TeamsOp>(op->getParentOp())) {
-      return failure();
+  LogicalResult matchAndRewrite(omp::LoopNestOp op, PatternRewriter &rewriter) const override {
+    llvm::SmallVector<omp::LoopWrapperInterface> wrappers;
+    op.gatherWrappers(wrappers);
+    if (wrappers.size() == 0) {
+      return rewriter.notifyMatchFailure(op, "loop_nest has no wrapper!");
     }
-    assert(op.getRegion().hasOneBlock());
-    auto& block = op.getRegion().getBlocks().front();
-    assert(block.getOperations().size() == 1);
-    Operation& firstOp = block.getOperations().front();
-    llvm::DenseSet<StringRef> transformedNamespaces = {"scf", "fir"};
-
-    if (auto nestLoopOp = llvm::dyn_cast<omp::LoopNestOp>(&firstOp)) {
-      auto res = replaceNestLoopOp(nestLoopOp, op, rewriter);
-      if (res.failed()) {
-        return failure();
-      }
-    } else if (transformedNamespaces.contains(firstOp.getDialect()->getNamespace())) {
-      return failure();
-    } else {
-      llvm::errs() << "\nUnexpected Operation: ";
-      firstOp.dump();
-      return failure();
+    for (omp::LoopWrapperInterface wrapper : wrappers) {
+      if (!isSupportedLoopWrapper(wrapper))
+        return rewriter.notifyMatchFailure(op, "unsupported loop wrapper");
     }
-
-    if (isTrivialWsloop(op)) {
-      rewriter.inlineBlockBefore(
-        &block,
-        op->getBlock(),
-        op->getIterator()
-      );
-      rewriter.eraseOp(op);
-      return success();
-    }
-    return failure();
+    Operation* outmostWrapper = wrappers.back().getOperation();
+    return replaceNestLoopOp(op, outmostWrapper, rewriter);
   }
 };
 
@@ -383,17 +402,22 @@ template<typename T>
 struct NestedStructurePattern: public OpRewritePattern<T> {
   using OpRewritePattern<T>::OpRewritePattern;
   
-  bool noOtherOmpWrapperInside(T op) const {
+  bool hasOtherOmpWrapperInside(T op) const {
     Block& b = op.getRegion().getBlocks().front();
-    auto hasAnotherOmpWrapper = false;
-    b.walk([&](Operation* subOp){
-      if (subOp->getDialect()->getNamespace() == "omp") {
-        hasAnotherOmpWrapper = true;
-        WalkResult::interrupt();
+    WalkResult res = b.walk([&](Operation* subOp) -> WalkResult {
+      if (llvm::isa<
+          omp::TeamsOp,
+          omp::DistributeOp,
+          omp::ParallelOp,
+          omp::WsloopOp,
+          omp::LoopNestOp,
+          omp::LoopOp,
+          omp::SimdOp>(subOp)) {
+        return WalkResult::interrupt();
       }
-      WalkResult::advance();
+      return WalkResult::advance();
     });
-    return hasAnotherOmpWrapper;
+    return res.wasInterrupted();
   }
 
   LogicalResult matchAndRewrite(T op, PatternRewriter &rewriter) const override{
@@ -409,7 +433,7 @@ struct NestedStructurePattern: public OpRewritePattern<T> {
     if (op->getDialect()->getNamespace()!="omp") {
       return failure();
     }
-    if (!noOtherOmpWrapperInside(op)) {
+    if (hasOtherOmpWrapperInside(op)) {
       return failure();
     }
 
@@ -436,7 +460,7 @@ struct NestedStructurePattern: public OpRewritePattern<T> {
         if (subOp->getDialect()->getNamespace() != "omp") {
           return WalkResult::skip();
         }
-        if (isa<omp::LoopWrapperInterface>(op->getParentOp())) {
+        if (isa<omp::LoopWrapperInterface>(subOp)) {
           contains = true;
           return WalkResult::interrupt();
         }
@@ -465,7 +489,6 @@ public:
     patterns.add<MapHostEvalPattern>(ctx);
     patterns.add<ReplaceLoopPattern>(ctx);
     patterns.add<NestedStructurePattern<omp::ParallelOp>>(ctx);
-    patterns.add<NestedStructurePattern<omp::DistributeOp>>(ctx);
     patterns.add<NestedStructurePattern<omp::TeamsOp>>(ctx);
     GreedyRewriteConfig config;
     config.enableFolding();
@@ -475,15 +498,6 @@ public:
       signalPassFailure();
       return;
     }
-    //
-    // RewritePatternSet deNestPatterns(ctx);
-    // deNestPatterns.add<NestedStructurePattern>(ctx);
-    // FrozenRewritePatternSet deNestPatternSet(std::move(deNestPatterns));
-    // if (failed(applyPatternsGreedily(moduleOp, deNestPatternSet, config))) {
-    //   signalPassFailure();
-    //   return;
-    // }
-
     return;
   };
 };
