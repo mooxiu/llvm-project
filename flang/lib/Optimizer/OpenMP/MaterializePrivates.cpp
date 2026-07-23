@@ -1,11 +1,14 @@
 #include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/Dialect/FIRType.h"
 #include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/OpenMP/Passes.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <mlir/Dialect/OpenMP/OpenMPDialect.h>
 #include <mlir/Dialect/OpenMP/OpenMPOpsEnums.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/IR/Value.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 namespace flangomp {
@@ -30,12 +33,30 @@ static unsigned getMapVarsOffset(Operation* wrapper) {
 struct MaterializeImplicitPrivatesPattern: public OpRewritePattern<omp::TargetOp> {
   using OpRewritePattern<omp::TargetOp>::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const {
+  // TODO: should cover all the situations that I support
+  bool isDeclaredLocally(Value val) const {
+    auto* defOp = val.getDefiningOp();
+    if (!defOp) {
+      return false;
+    }
+    if (llvm::isa<fir::AllocaOp>(defOp)) {
+      return true;
+    }
+    if (auto declareOp = llvm::dyn_cast<hlfir::DeclareOp>(defOp)) {
+      return isDeclaredLocally(declareOp.getMemref());
+    }
+    if (auto mapInfoOp = llvm::dyn_cast<omp::MapInfoOp>(defOp)) {
+      return isDeclaredLocally(mapInfoOp.getVarPtr());
+    }
+    return false;
+  }
+
+  LogicalResult matchAndRewrite(omp::TargetOp op, PatternRewriter &rewriter) const override {
     unsigned mapVarArgOffset = getMapVarsOffset(op); 
     auto& entryBlock = op.getRegion().getBlocks().front(); 
 
     llvm::SmallVector<int> indicesToMaterialize;
-    for (int i = 0; i < op.numMapBlockArgs(); i++) {
+    for (unsigned i = 0; i < op.numMapBlockArgs(); i++) {
       auto mapVar = op.getMapVars()[i]; 
       auto mapVarArg = entryBlock.getArgument(i + mapVarArgOffset);
       
@@ -53,26 +74,41 @@ struct MaterializeImplicitPrivatesPattern: public OpRewritePattern<omp::TargetOp
         }
       }
       if (!hasDeclareOp) continue;
-      assert(mapVar.getType().isIntOrIndexOrFloat()); 
+
+      if (!isDeclaredLocally(mapVar)) {
+        continue;
+      }
+
+      assert(llvm::isa<fir::ReferenceType>(mapVarArg.getType()));
+      auto argEleType = fir::unwrapRefType(mapVarArg.getType());
+      assert(argEleType.isIntOrIndexOrFloat());
+
+      indicesToMaterialize.push_back(i);
     }
 
     if (indicesToMaterialize.size() == 0) {
       return failure();
     }
 
-    OpBuilder::InsertionGuard guard(rewriter);
+    llvm::errs() << "\n[DEBUG]We have " << indicesToMaterialize.size() << " indices to materialize.";
     for (const int idx: indicesToMaterialize) {
+      llvm::errs() << "\n[DEBUG]Idx to materialize: " << idx;
       rewriter.setInsertionPointToStart(&entryBlock);
-      auto mapVar = op.getMapVars()[idx]; 
+      // auto mapVar = op.getMapVars()[idx]; 
       auto mapVarArg = entryBlock.getArgument(idx + mapVarArgOffset);
-      auto allocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), mapVarArg.getType());
-      auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), mapVar);
-      fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), allocaOp.getResult());
-      rewriter.replaceAllUsesWith(mapVarArg, allocaOp.getResult());
-      assert(mapVarArg.getUses().empty());
-    }
+      llvm::errs() << "\n[DEBUG]MapVarArg:";
+      mapVarArg.printAsOperand(llvm::errs(), {});
+      llvm::errs() << "\n";
+      
+      assert(llvm::isa<fir::ReferenceType>(mapVarArg.getType()));
+      auto argEleType = fir::unwrapRefType(mapVarArg.getType());
 
-    return failure();
+      auto allocaOp = fir::AllocaOp::create(rewriter, op.getLoc(), argEleType);
+      auto loadOp = fir::LoadOp::create(rewriter, op.getLoc(), mapVarArg);
+      fir::StoreOp::create(rewriter, op.getLoc(), loadOp.getResult(), allocaOp.getResult());
+      rewriter.replaceAllUsesExcept(mapVarArg, allocaOp.getResult(), loadOp);
+    }
+    return success();
   }
 };
 
