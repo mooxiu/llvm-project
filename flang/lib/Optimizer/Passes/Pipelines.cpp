@@ -272,8 +272,10 @@ void createHLFIRToFIRPassPipeline(mlir::PassManager &pm,
                                   const MLIRToLLVMPassPipelineConfig &config) {
   llvm::OptimizationLevel optLevel = config.OptLevel;
   if (jitWorkdistribute) {
-    pm.addPass(flangomp::createMaterializePrivates());
+    // FlattenOpenMPTarget's result can move host_eval to map_entries, and they might be processed by MaterializePrivates.
+    // So this ordering should not change once the responsibilities of the passes are stable.
     pm.addPass(flangomp::createFlattenOpenMPTarget());
+    pm.addPass(flangomp::createMaterializePrivates());
     pm.addPass(flangomp::createLowerWorkdistributeToJit());
   }
 
