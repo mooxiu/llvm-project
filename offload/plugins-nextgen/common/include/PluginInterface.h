@@ -70,7 +70,7 @@ template <typename ResourceRef> class GenericDeviceResourceManagerTy;
 namespace Plugin {
 
 struct DelegatedLaunchArgs {
-  enum class DeviceTyTy { CUDA, AMD, TPU, HOST };
+  enum class DeviceTyTy { CUDA, AMD, TPU, VirPU, HOST };
   DeviceTyTy DeviceTy;
   void *Device;
   void *Stream;

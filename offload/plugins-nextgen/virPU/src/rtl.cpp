@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "../dynamic_tpu/pjrt_c_api.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +20,6 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <string>
-#include "../dynamic_tpu/pjrt_c_api.h"
 
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
@@ -35,7 +35,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/TargetParser/Triple.h"
 
 using namespace error;
@@ -45,16 +44,20 @@ namespace omp {
 namespace target {
 namespace plugin {
 
+namespace {
+  struct VirPUDeviceImageTy : public DeviceImageTy {
+    VirPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
+                       std::unique_ptr<MemoryBuffer> Image)
+        : DeviceImageTy(ImageId, Device, std::move(Image)) {}
+  };
+} // namespace
+
+
 /// Forward declarations for all specialized data structures.
 struct VirPUKernelTy;
 struct VirPUDeviceTy;
 struct VirPUPluginTy;
 
-struct VirPUDeviceImageTy : public DeviceImageTy {
-  VirPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
-                   std::unique_ptr<MemoryBuffer> Image)
-      : DeviceImageTy(ImageId, Device, std::move(Image)) {}
-};
 
 struct VirPUKernelTy : public GenericKernelTy {
   VirPUKernelTy(const char *Name) : GenericKernelTy(Name) {}
@@ -82,38 +85,33 @@ struct VirPUKernelTy : public GenericKernelTy {
 };
 
 struct VirPUDeviceTy : public GenericDeviceTy {
-  const PJRT_Api* pjrtApi;
-  PJRT_Client* pjrtCleint;
-  PJRT_Device* pjrtDevice;
+  const PJRT_Api *PjrtApi;
+  PJRT_Client *PjrtCleint;
+  PJRT_Device *PjrtDevice;
 
   struct PjrtBufferContext {
-    PJRT_Buffer* PjrtBuf;
-    PJRT_AsyncHostToDeviceTransferManager* TransferManager;
-    bool isRealLast; 
+    PJRT_Buffer *PjrtBuf;
+    PJRT_AsyncHostToDeviceTransferManager *TransferManager;
+    bool IsRealLast;
   };
 
   VirPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
-              PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
+                PJRT_Api *Api, PJRT_Client *Client, PJRT_Device *Device)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
-        pjrtApi(Api), pjrtCleint(Client), pjrtDevice(Device) {
-    // printf("\nVirPUDeviceTy init success!\n");
+        PjrtApi(Api), PjrtCleint(Client), PjrtDevice(Device) {
   }
 
   ~VirPUDeviceTy() {}
 
   /// Initialize the device, its resources and get its properties.
-  Error initImpl(GenericPluginTy &Plugin) override {
-    return Plugin::success();
-  }
+  Error initImpl(GenericPluginTy &Plugin) override { return Plugin::success(); }
 
   Error unloadBinaryImpl(DeviceImageTy *Image) override {
     return Plugin::success();
   }
 
   /// Deinitialize the device and release its resources.
-  Error deinitImpl() override {
-    return Plugin::success();
-  }
+  Error deinitImpl() override { return Plugin::success(); }
 
   virtual Error callGlobalConstructors(GenericPluginTy &Plugin,
                                        DeviceImageTy &Image) override {
@@ -142,33 +140,33 @@ struct VirPUDeviceTy : public GenericDeviceTy {
 
   /// We want to set up the RPC server for host services to the GPU if it is
   /// available.
-  bool shouldSetupRPCServer() const override { 
-    return false; }
+  bool shouldSetupRPCServer() const override { return false; }
 
   /// Allocate memory on the device or related to the device.
   Expected<void *> allocate(size_t Size, void *, TargetAllocTy Kind) override {
     if (Size == 0) {
       // printf("\n Nothing needs to be allocated!\n");
       return nullptr;
-    } 
+    }
     // This is the ptr to the target memory
     return malloc(Size);
   }
 
   /// Deallocate memory on the device or related to the device.
   Error free(void *TgtPtr, TargetAllocTy Kind) override {
-    if(!TgtPtr) {
+    if (!TgtPtr) {
       return Plugin::success();
     }
 
-    typedef void (*DestroyBufFn)(void*, const PJRT_Api*);
-    DestroyBufFn destroy_buf = (DestroyBufFn)dlsym(RTLD_DEFAULT, "DestroyPjrtBuffer");
-    if (destroy_buf) {
-        destroy_buf(TgtPtr, this->pjrtApi);
+    typedef void (*DestroyBufFn)(void *, const PJRT_Api *);
+    DestroyBufFn DestroyPjrtBufferFn =
+        (DestroyBufFn)dlsym(RTLD_DEFAULT, "DestroyPjrtBuffer");
+    if (DestroyPjrtBufferFn) {
+      DestroyPjrtBufferFn(TgtPtr, this->PjrtApi);
     } else {
-        std::cerr << "Warning: DestroyPjrtBuffer not found in executor.\n";
+      std::cerr << "Warning: DestroyPjrtBuffer not found in executor.\n";
     }
-    std::free(TgtPtr); 
+    std::free(TgtPtr);
     return Plugin::success();
   }
 
@@ -179,9 +177,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
     return Plugin::success();
   }
 
-  bool supportVAManagement() const override {
-    return true;
-  }
+  bool supportVAManagement() const override { return true; }
 
   Expected<bool> isPinnedPtrImpl(void *HstPtr, void *&BaseHstPtr,
                                  void *&BaseDevAccessiblePtr,
@@ -207,31 +203,31 @@ struct VirPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     }
 
-    typedef PJRT_Buffer* (*GetBufFn)(void*);
-    GetBufFn get_buf = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
+    typedef PJRT_Buffer *(*GetBufFn)(void *);
+    GetBufFn GetPjrtBufferFn = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
 
-    PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
+    PJRT_Buffer *PjrtBuf = GetPjrtBufferFn(const_cast<void *>(TgtPtr));
     if (PjrtBuf) {
       // Can not use `PJRT_Buffer_CopyRawToHost`, the result would be weird.
-      auto args = PJRT_Buffer_ToHostBuffer_Args{
-        .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
-        .src = PjrtBuf,
-        .dst = HstPtr,
-        .dst_size = size_t(Size)
+      auto Args = PJRT_Buffer_ToHostBuffer_Args{
+          .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
+          .src = PjrtBuf,
+          .dst = HstPtr,
+          .dst_size = size_t(Size)
       };
-      auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
-      assert(!err);
+      auto *Err = this->PjrtApi->PJRT_Buffer_ToHostBuffer(&Args);
+      assert(!Err);
 
-      auto awaitArgs = PJRT_Event_Await_Args{
-        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-        .event = args.event
+      auto AwaitArgs = PJRT_Event_Await_Args{
+          .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+          .event = Args.event
       };
-      auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-      assert(!err2);
+      auto *Err2 = this->PjrtApi->PJRT_Event_Await(&AwaitArgs);
+      assert(!Err2);
     }
 
     return Plugin::success();
-   }
+  }
 
   /// Exchange data between two devices directly. We may use peer access if
   /// the CUDA devices and driver allow them.
@@ -316,9 +312,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   Error setDeviceStackSize(uint64_t Value) override {
     llvm_unreachable("VirPUDeviceTy setDeviceStackSize");
   }
-  bool hasDeviceHeapSize() override { 
-    return true; 
-  }
+  bool hasDeviceHeapSize() override { return true; }
   Error getDeviceHeapSize(uint64_t &Value) override {
     Value = 0;
     return Plugin::success();
@@ -341,8 +335,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   }
 
   /// Returns the clock frequency for the given NVPTX device.
-  uint64_t getClockFrequency() const override { 
-    return 1000000000; }
+  uint64_t getClockFrequency() const override { return 1000000000; }
 
   Error callGlobalCtorDtorCommon(GenericPluginTy &Plugin, DeviceImageTy &Image,
                                  bool IsCtor) {
@@ -360,34 +353,29 @@ struct VirPUDeviceTy : public GenericDeviceTy {
     return VirPUImage;
   }
 
-  Error destroyEventImpl(void *EventPtr) override {
-    return Plugin::success();
-  }
+  Error destroyEventImpl(void *EventPtr) override { return Plugin::success(); }
 
   Error recordEventImpl(void *EventPtr,
                         AsyncInfoWrapperTy &AsyncInfoWrapper) override {
     return Plugin::success();
   }
 
-  Error syncEventImpl(void *EventPtr) override {
-    return Plugin::success();
-  }
+  Error syncEventImpl(void *EventPtr) override { return Plugin::success(); }
 
   Expected<float> getEventElapsedTimeImpl(void *StartEventPtr,
                                           void *EndEventPtr) override {
     return Plugin::success();
   };
 
-  Expected<bool> hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    return false; 
+  Expected<bool>
+  hasPendingWorkImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    return false;
   }
 
-  bool useAutoZeroCopyImpl() override {
-    return false; 
-  }
+  bool useAutoZeroCopyImpl() override { return false; }
 
   Expected<bool> isAccessiblePtrImpl(const void *Ptr, size_t Size) override {
-    return false; 
+    return false;
   }
 
   struct ComputeCapabilityTy {
@@ -401,6 +389,22 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   /// The maximum number of warps that can be resident on all the SMs
   /// simultaneously.
   uint32_t HardwareParallelism = 0;
+
+public:
+  Error setContext() override { llvm_unreachable("VirPU setContext"); }
+
+  Error queryAsyncImpl(__tgt_async_info &AsyncInfo, bool ReleaseQueue,
+                       bool *IsQueueWorkCompleted) override {
+    llvm_unreachable("VirPU queryAsyncImpl");
+  }
+
+  Expected<void *> dataLockImpl(void *HstPtr, int64_t Size) override {
+    llvm_unreachable("VirPU dataLockImpl");
+  }
+
+  Error dataUnlockImpl(void *HstPtr) override {
+    llvm_unreachable("VirPU dataUnlockImpl");
+  }
 };
 
 Error VirPUKernelTy::delegatedLaunchImpl(
@@ -409,22 +413,23 @@ Error VirPUKernelTy::delegatedLaunchImpl(
     AsyncInfoWrapperTy &AsyncInfoWrapper) const {
   VirPUDeviceTy &VirPUDevice = static_cast<VirPUDeviceTy &>(GenericDevice);
   Plugin::DelegatedLaunchArgs DLA{
-      Plugin::DelegatedLaunchArgs::DeviceTyTy::VirPU, 
-      &VirPUDevice,                                    
-      nullptr
-      // VirPUPlugin->PjrtClient          
+      Plugin::DelegatedLaunchArgs::DeviceTyTy::VirPU, &VirPUDevice, nullptr
+      // VirPUPlugin->PjrtClient
   };
   int64_t Res = DelegatedLaunch(&DLA);
   // std::this_thread::sleep_for(std::chrono::seconds(10));
   if (Res)
-    return Plugin::error(ErrorCode::UNSUPPORTED, "Error in VirPU delegated launch");
+    return Plugin::error(ErrorCode::UNSUPPORTED,
+                         "Error in VirPU delegated launch");
   return Plugin::success();
 }
 
-Error VirPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice, uint32_t NumThreads[3],
-                   uint32_t NumBlocks[3], uint32_t DynBlockMemSize,
-                   KernelArgsTy &KernelArgs, KernelLaunchParamsTy LaunchParams,
-                   AsyncInfoWrapperTy &AsyncInfoWrapper) const {
+Error VirPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
+                                uint32_t NumThreads[3], uint32_t NumBlocks[3],
+                                uint32_t DynBlockMemSize,
+                                KernelArgsTy &KernelArgs,
+                                KernelLaunchParamsTy LaunchParams,
+                                AsyncInfoWrapperTy &AsyncInfoWrapper) const {
   return Plugin::success();
 }
 
@@ -444,13 +449,15 @@ public:
 #define DEVICE_TYPE "cpu"
 
 struct VirPUPluginTy final : public GenericPluginTy {
-  // Although claimed to only have one device, VirPUPluginTy actually manage multiple devices, which forms a device mesh.
-  // Devices can be logically formed as a multi-dimensional mesh.
-  // i.e., a 2x3 mesh means we have 6 devices and logically formed as a 2 row 3 column matrix.
-  // TODO: how should I init this DeviceMesh? Currently I can do in initImpl and find all devices and form 1 dimensional.
+  // Although claimed to only have one device, VirPUPluginTy actually manage
+  // multiple devices, which forms a device mesh. Devices can be logically
+  // formed as a multi-dimensional mesh. i.e., a 2x3 mesh means we have 6
+  // devices and logically formed as a 2 row 3 column matrix.
+  // TODO: how should I init this DeviceMesh? Currently I can do in initImpl and
+  // find all devices and form 1 dimensional.
   llvm::SmallVector<uint8_t> DeviceMesh;
-  PJRT_Api* PjrtApi;
-  PJRT_Client* PjrtClient = nullptr;
+  PJRT_Api *PjrtApi;
+  PJRT_Client *PjrtClient = nullptr;
 
   VirPUPluginTy() : GenericPluginTy(getTripleArch()) {}
 
@@ -458,11 +465,10 @@ struct VirPUPluginTy final : public GenericPluginTy {
   VirPUPluginTy(const VirPUPluginTy &) = delete;
   VirPUPluginTy(VirPUPluginTy &&) = delete;
 
-
   std::string getDeviceDescription(const PJRT_Api *api, PJRT_Device *device) {
     PJRT_Device_GetDescription_Args args = {
-      .struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE,
-      .device = device,
+        .struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE,
+        .device = device,
     };
     auto err1 = api->PJRT_Device_GetDescription(&args);
     if (err1) {
@@ -470,8 +476,8 @@ struct VirPUPluginTy final : public GenericPluginTy {
       return nullptr;
     }
     PJRT_DeviceDescription_ToString_Args ts_args = {
-      .struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE,
-      .device_description = args.device_description,
+        .struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE,
+        .device_description = args.device_description,
     };
     auto err2 = api->PJRT_DeviceDescription_ToString(&ts_args);
     if (err2) {
@@ -481,51 +487,49 @@ struct VirPUPluginTy final : public GenericPluginTy {
     return ts_args.to_string;
   }
 
-  
   // WARN: this only return a sincle device
-  // Get the target device handle
-  PJRT_Device *findDevice(
-    const PJRT_Api *api, 
-    PJRT_Client *client,
-    const std::string &deviceDescKeyword
-  ) {
-    PJRT_Client_AddressableDevices_Args device_args = {
-      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
-      .client = client,
+  // This practically return the first PjrtDevice found satisfying the description, even there are multiple devices.
+  PJRT_Device *findDevice(const PJRT_Api *PjrtApi, PJRT_Client *PjrtClient,
+                          const std::string &DeviceDescKeyword) {
+    PJRT_Client_AddressableDevices_Args DeviceArgs = {
+        .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
+        .client = PjrtClient,
     };
-    auto err = api->PJRT_Client_AddressableDevices(&device_args);
-    if (err || device_args.num_addressable_devices < 1) {
-      std::cerr << "no devices found!\n"; 
+    auto* Err = PjrtApi->PJRT_Client_AddressableDevices(&DeviceArgs);
+    if (Err || DeviceArgs.num_addressable_devices < 1) {
+      std::cerr << "no devices found!\n";
       return nullptr;
     }
 
-    int chosen_device_idx = -1;
-    std::string desc = ""; // for logging purpose
-    for (size_t i = 0; i < device_args.num_addressable_devices; i++) {
-      std::string tmp = getDeviceDescription(api, device_args.addressable_devices[i]);
-      llvm::dbgs() << "We're getting description like: " << tmp << "\n" ;
-      std::transform(tmp.begin(), tmp.end(), tmp.begin(),[](unsigned char c) { return std::tolower(c); });
-      if (tmp.find(deviceDescKeyword) != std::string::npos) {
-        chosen_device_idx = i;
-        desc = tmp;
+    int ChosenDeviceID = -1;
+    std::string Desc = ""; // for logging purpose
+    for (size_t i = 0; i < DeviceArgs.num_addressable_devices; i++) {
+      std::string DeviceDesc =
+          getDeviceDescription(PjrtApi, DeviceArgs.addressable_devices[i]);
+      llvm::dbgs() << "We're getting description like: " << DeviceDesc << "\n";
+      std::transform(DeviceDesc.begin(), DeviceDesc.end(), DeviceDesc.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (DeviceDesc.find(DeviceDescKeyword) != std::string::npos) {
+        ChosenDeviceID = i;
+        Desc = DeviceDesc;
         break;
       }
     }
-    if (chosen_device_idx == -1) {
+    if (ChosenDeviceID == -1) {
       std::cerr << "no device found, but why?!\n";
       return nullptr;
     }
-    return device_args.addressable_devices[chosen_device_idx];
+    return DeviceArgs.addressable_devices[ChosenDeviceID];
   }
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    const char* custom_path = std::getenv("LIBVirPU_PATH");
-    void* Handle = nullptr;
-    if (custom_path != nullptr) {
-      Handle =  dlopen(custom_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    const char *CustomPath = std::getenv("LIBVirPU_PATH");
+    void *Handle = nullptr;
+    if (CustomPath != nullptr) {
+      Handle = dlopen(CustomPath, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     } else {
-      Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+      Handle = dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     }
     if (!Handle) {
       printf("VirPU plugin not found, fall back to CPU!\n");
@@ -537,26 +541,28 @@ struct VirPUPluginTy final : public GenericPluginTy {
       std::cerr << "error finding GetPjrtApi: " << dlerror() << std::endl;
       std::exit(EXIT_FAILURE);
     }
-    PJRT_Api* Api = GetApiFn();
+    PJRT_Api *Api = GetApiFn();
     assert(Api && "Can not get APi!");
     PJRT_Plugin_Initialize_Args InitArgs = {};
     InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-    auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
-    // Theoretically need to close handle_ when exiting, but it will automatically be destroyed when exiting the program so intentionally leave it.
+    auto *InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
+    // Theoretically need to close handle_ when exiting, but it will
+    // automatically be destroyed when exiting the program so intentionally
+    // leave it.
     this->PjrtApi = Api;
-    
-    typedef PJRT_Client* (*GetClientFn)();
-    GetClientFn get_client = (GetClientFn)dlsym(RTLD_DEFAULT, "GetExecutorPJRTClient");
-    if (get_client) {
-      this->PjrtClient = get_client();
+
+    typedef PJRT_Client *(*GetClientFn)();
+    GetClientFn GetPjrtClientFn =
+        (GetClientFn)dlsym(RTLD_DEFAULT, "GetExecutorPJRTClient");
+    if (GetPjrtClientFn) {
+      this->PjrtClient = GetPjrtClientFn();
     } else {
       PJRT_Plugin_Initialize_Args InitArgs = {};
       InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-      auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
-      PJRT_Client_Create_Args args = {
-        .struct_size= PJRT_Client_Create_Args_STRUCT_SIZE
-      };
-      auto* error = Api->PJRT_Client_Create(&args);
+      auto *InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
+      PJRT_Client_Create_Args args = {.struct_size =
+                                          PJRT_Client_Create_Args_STRUCT_SIZE};
+      auto *error = Api->PJRT_Client_Create(&args);
       if (error) {
         std::cerr << "Fail to create client!\n";
         std::exit(EXIT_FAILURE);
@@ -564,26 +570,21 @@ struct VirPUPluginTy final : public GenericPluginTy {
       this->PjrtClient = args.client;
     }
 
-    SmallVector<PJRT_Device*> Devices = findAllDevices(
-      this->PjrtApi, 
-      this->PjrtClient, 
-      DEVICE_TYPE);
-
-
+    SmallVector<PJRT_Device *> Devices =
+        findAllDevices(this->PjrtApi, this->PjrtClient, DEVICE_TYPE);
 
     return DECLARED_DEVICE_COUNT;
   }
 
   /// Deinitialize the plugin.
-  Error deinitImpl() override {
-    return Plugin::success(); }
+  Error deinitImpl() override { return Plugin::success(); }
 
-  GenericDeviceTy *createDevice(
-    GenericPluginTy &Plugin, 
-    int32_t DeviceId,
-    int32_t NumDevices) override {
-    auto* VirPUDevice = findDevice(this->PjrtApi, this->PjrtClient, DEVICE_TYPE);
-    return new VirPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi, this->PjrtClient, VirPUDevice);
+  GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
+                                int32_t NumDevices) override {
+    PJRT_Device *VirPUDevice =
+        findDevice(this->PjrtApi, this->PjrtClient, DEVICE_TYPE);
+    return new VirPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi,
+                             this->PjrtClient, VirPUDevice);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {
@@ -591,69 +592,67 @@ struct VirPUPluginTy final : public GenericPluginTy {
   }
 
   /// Get the ELF code for recognizing the compatible image binary.
-  uint16_t getMagicElfBits() const override { 
-    return ELF::EM_X86_64;
-  }
+  uint16_t getMagicElfBits() const override { return ELF::EM_X86_64; }
 
   Triple::ArchType getTripleArch() const override {
-    // We actually use x86 here, it does not matter as we will jit execute code rather than compile to VirPU target in LLVM
+    // We actually use x86 here, it does not matter as we will jit execute code
+    // rather than compile to VirPU target in LLVM
     return Triple::x86_64;
   }
 
-  const char *getName() const override { 
-    return GETNAME(TARGET_NAME); }
+  const char *getName() const override { return GETNAME(TARGET_NAME); }
 
   Expected<bool> isELFCompatible(uint32_t DeviceId,
                                  StringRef Image) const override {
     return true;
   }
 
-
 private:
-  void mapDevicesToMesh(llvm::SmallVector<PJRT_Device*> Devices) {
+  void mapDevicesToMesh(llvm::SmallVector<PJRT_Device *> Devices) {
     // TODO: how do we get the initial device mesh?
     this->DeviceMesh = {uint8_t(Devices.size())};
     return;
   }
 
-  llvm::SmallVector<PJRT_Device*> findAllDevices(
-    const PJRT_Api *api, 
-    PJRT_Client *client,
-    const std::string &deviceDescKeyword
-  ) {
-    PJRT_Client_AddressableDevices_Args device_args = {
-      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
-      .client = client,
+  llvm::SmallVector<PJRT_Device *>
+  findAllDevices(const PJRT_Api *PjrtApi, PJRT_Client *PjrtClient,
+                 const std::string &DeviceDescKeyword) {
+    PJRT_Client_AddressableDevices_Args DeviceArgs = {
+        .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
+        .client = PjrtClient,
     };
-    llvm::SmallVector<PJRT_Device*> devicesFound;
-    auto* err = api->PJRT_Client_AddressableDevices(&device_args);
-    if (err || device_args.num_addressable_devices < 1) {
-      std::cerr << "no devices found!\n"; 
-      return devicesFound;
+    llvm::SmallVector<PJRT_Device *> DevicesFound;
+    auto *Err = PjrtApi->PJRT_Client_AddressableDevices(&DeviceArgs);
+    if (Err || DeviceArgs.num_addressable_devices < 1) {
+      std::cerr << "no devices found!\n";
+      return DevicesFound;
     }
 
-    for (size_t i = 0; i < device_args.num_addressable_devices; i++) {
-      std::string tmp = getDeviceDescription(api, device_args.addressable_devices[i]);
-      std::transform(tmp.begin(), tmp.end(), tmp.begin(),[](unsigned char c) { return std::tolower(c); });
-      if (tmp.find(deviceDescKeyword) != std::string::npos) {
-        devicesFound.push_back(device_args.addressable_devices[i]);
+    for (size_t i = 0; i < DeviceArgs.num_addressable_devices; i++) {
+      std::string DeviceDesc =
+          getDeviceDescription(PjrtApi, DeviceArgs.addressable_devices[i]);
+      std::transform(DeviceDesc.begin(), DeviceDesc.end(), DeviceDesc.begin(),
+                     [](unsigned char Char) { return std::tolower(Char); });
+      if (DeviceDesc.find(DeviceDescKeyword) != std::string::npos) {
+        DevicesFound.push_back(DeviceArgs.addressable_devices[i]);
       }
     }
-    return devicesFound; 
+    return DevicesFound;
   }
 };
 
-Error VirPUDeviceTy::dataExchangeImpl(const void *SrcPtr,
-                                     GenericDeviceTy &DstGenericDevice,
-                                     void *DstPtr, int64_t Size,
-                                     AsyncInfoWrapperTy &AsyncInfoWrapper) {
-  llvm_unreachable("VirPUDeviceTy::dataExchangeImpl");
-}
+// Error VirPUDeviceTy::dataExchangeImpl(const void *SrcPtr,
+//                                      GenericDeviceTy &DstGenericDevice,
+//                                      void *DstPtr, int64_t Size,
+//                                      AsyncInfoWrapperTy &AsyncInfoWrapper) {
+//   llvm_unreachable("VirPUDeviceTy::dataExchangeImpl");
+// }
 
-template <typename... ArgsTy>
-static Error Plugin::check(int32_t Code, const char *ErrFmt, ArgsTy... Args) {
-  llvm_unreachable("Plugin::check");
-}
+// template <typename... ArgsTy>
+// static Error Plugin::check(int32_t Code, const char *ErrFmt, ArgsTy... Args)
+// {
+//   llvm_unreachable("Plugin::check");
+// }
 
 } // namespace plugin
 } // namespace target
