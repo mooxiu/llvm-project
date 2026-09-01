@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../dynamic_tpu/pjrt_c_api.h"
+#include "../dynamic_vpu/pjrt_c_api.h"
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -560,8 +560,9 @@ struct VirPUPluginTy final : public GenericPluginTy {
       PJRT_Plugin_Initialize_Args InitArgs = {};
       InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
       auto *InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
-      PJRT_Client_Create_Args args = {.struct_size =
-                                          PJRT_Client_Create_Args_STRUCT_SIZE};
+      PJRT_Client_Create_Args args = {
+        .struct_size = PJRT_Client_Create_Args_STRUCT_SIZE
+      };
       auto *error = Api->PJRT_Client_Create(&args);
       if (error) {
         std::cerr << "Fail to create client!\n";
