@@ -43,6 +43,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/FunctionComparator.h"
 
@@ -128,7 +129,7 @@ struct TPUEventRef final : public GenericDeviceResourceRef {
 struct TPUDeviceTy : public GenericDeviceTy {
   const PJRT_Api* pjrtApi;
   PJRT_Client* pjrtCleint;
-  PJRT_Device* pjrtDevice;
+  // PJRT_Device* pjrtDevice;
 
   struct PjrtBufferContext {
     PJRT_Buffer* PjrtBuf;
@@ -139,9 +140,12 @@ struct TPUDeviceTy : public GenericDeviceTy {
   TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
               PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
-        pjrtApi(Api), pjrtCleint(Client), pjrtDevice(Device) {
+        pjrtApi(Api), pjrtCleint(Client) {
     // printf("\nTPUDeviceTy init success!\n");
   }
+
+  TPUDeviceTy(GenericPluginTy &Plugin) 
+    : GenericDeviceTy(Plugin, 0, 1, NVPTXGridValues) {}
 
   ~TPUDeviceTy() {}
 
@@ -216,73 +220,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
     } 
     // This is the ptr to the target memory
     return malloc(Size);
-
-    // void* ptr = nullptr;
-    // switch (Kind) {
-    //   case TargetAllocTy::TARGET_ALLOC_DEFAULT:
-    //   case TargetAllocTy::TARGET_ALLOC_DEVICE: {
-    //     PJRT_Device_DefaultMemory_Args mem_args = {};
-    //     mem_args.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
-    //     mem_args.device = this->pjrtDevice;
-    //     auto* mem_err = this->pjrtApi->PJRT_Device_DefaultMemory(&mem_args);
-    //     assert(!mem_err);
-    //     PJRT_Memory* memory = mem_args.memory;
-    //
-    //     int64_t dims[1] = { static_cast<int64_t>(Size) };
-    //     PJRT_ShapeSpec shape_spec = {};
-    //     shape_spec.struct_size = PJRT_ShapeSpec_STRUCT_SIZE;
-    //     shape_spec.dims = dims;
-    //     shape_spec.num_dims = 1;
-    //     shape_spec.element_type = PJRT_Buffer_Type_S8;
-    //
-    //     PJRT_Client_CreateBuffersForAsyncHostToDevice_Args alloc_args = {};
-    //     alloc_args.struct_size = PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE;
-    //     alloc_args.client = this->pjrtCleint;
-    //     alloc_args.shape_specs = &shape_spec;
-    //     alloc_args.num_shape_specs = 1; 
-    //     alloc_args.device_layouts = nullptr; 
-    //     alloc_args.num_device_layouts = 0;
-    //     alloc_args.memory = memory;
-    //
-    //     auto* alloc_err = this->pjrtApi->PJRT_Client_CreateBuffersForAsyncHostToDevice(&alloc_args);
-    //     if (alloc_err) return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Failed to create async buffer");
-    //
-    //     PJRT_AsyncHostToDeviceTransferManager* tm = alloc_args.transfer_manager;
-    //
-    //     PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args retrieve_args = {};
-    //     retrieve_args.struct_size = PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args_STRUCT_SIZE;
-    //     retrieve_args.transfer_manager = tm;
-    //     retrieve_args.buffer_index = 0; 
-    //     this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer(&retrieve_args);
-    //     PJRT_Buffer* buffer = retrieve_args.buffer_out;
-    //
-    //     PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args ptr_args = {};
-    //     ptr_args.struct_size = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args_STRUCT_SIZE;
-    //     ptr_args.buffer = buffer;
-    //     this->pjrtApi->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&ptr_args);
-    //     void* AllocPtr = ptr_args.device_memory_ptr;
-    //
-    //     ptr = AllocPtr;
-    //
-    //     DeviceBufferMap[ptr] = {buffer, tm, false};
-    //
-    //     typedef void (*RegBufFn)(void*, PJRT_Buffer*);
-    //     RegBufFn reg_buf = (RegBufFn)dlsym(RTLD_DEFAULT, "RegisterPjrtBuffer");
-    //     if (reg_buf) {
-    //       reg_buf(AllocPtr, buffer); // Sharing with libjit-code-executor 
-    //     } 
-    //
-    //     break;
-    //   }
-    //   case TargetAllocTy::TARGET_ALLOC_HOST:
-    //   case TargetAllocTy::TARGET_ALLOC_SHARED: {
-    //     ptr = std::malloc(Size);
-    //       if (!ptr) {
-    //     return Plugin::error(ErrorCode::OUT_OF_RESOURCES, "Host malloc failed");
-    //   }
-    //   }
-    // }
-    // return ptr;
   }
 
   /// Deallocate memory on the device or related to the device.
@@ -355,46 +292,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
     // Creating buffer will happen on jit-code-executor side.
     memcpy(TgtPtr, HstPtr, Size);
     return Plugin::success();
-
-    // auto it = DeviceBufferMap.find(TgtPtr);
-    // if (it == DeviceBufferMap.end()) {
-    //   std::cerr << "Allocated memory pointer not found!\n";
-    //   exit(1);
-    // }
-    // PJRT_AsyncHostToDeviceTransferManager* tm = it->second.TransferManager;
-    //
-    // PJRT_AsyncHostToDeviceTransferManager_TransferData_Args transfer_args = {
-    //   .struct_size = PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE,
-    //   .transfer_manager = tm,
-    //   .buffer_index = 0,
-    //   .data = HstPtr,
-    //   .offset = 0,
-    //   .transfer_size = Size,
-    //   .is_last_transfer = true,
-    // };
-    //
-    //
-    // auto* err = this->pjrtApi->PJRT_AsyncHostToDeviceTransferManager_TransferData(&transfer_args);
-    // assert(!err);
-    //
-    // PJRT_Event* done_event = transfer_args.done_with_h2d_transfer;
-    // if (done_event) {
-    //   PJRT_Event_Await_Args await_args = {PJRT_Event_Await_Args_STRUCT_SIZE, nullptr, done_event};
-    //   this->pjrtApi->PJRT_Event_Await(&await_args);
-    // }
-    //
-    //
-    // auto awaitArgs = PJRT_Event_Await_Args {
-    //   .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-    //   // .event = args.done_with_host_buffer
-    //   .event = transfer_args.done_with_h2d_transfer
-    // };
-    // auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-    // assert(!err2);
-    //
-    // it->second.isRealLast = true;
-    //
-    // return Plugin::success();
   }
 
   /// Retrieve data from the device (device to host transfer).
@@ -709,17 +606,26 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    const char* custom_path = std::getenv("LIBTPU_PATH");
-    void* Handle = nullptr;
-    if (custom_path != nullptr) {
-      Handle =  dlopen(custom_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-    } else {
-      Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-    }
+    llvm::dbgs() << "[DEBUG] good, we are in TPU plugin now.\n";
+    const char* CustomPath = std::getenv("PJRT_PLUGIN_PATH");
+    llvm::dbgs() << "[DBEUG] The custom plugin path is: " << CustomPath << "\n";
+    void* Handle =  dlopen(CustomPath, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     if (!Handle) {
-      printf("TPU plugin not found, fall back to CPU!\n");
-      return 0;
+      llvm::errs() << "Should assign a PJRT plugin!\n";
+      std::exit(EXIT_FAILURE);
     }
+
+    // const char* custom_path = std::getenv("LIBTPU_PATH");
+    // void* Handle = nullptr;
+    // if (custom_path != nullptr) {
+    //   Handle =  dlopen(custom_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    // } else {
+    //   Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
+    // }
+    // if (!Handle) {
+    //   printf("TPU plugin not found, fall back to CPU!\n");
+    //   return 0;
+    // }
     // follow the example of `man dlopen`
     auto GetApiFn = (PJRT_Api * (*)()) dlsym(Handle, "GetPjrtApi");
     if (!GetApiFn) {
@@ -761,8 +667,8 @@ struct TPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    auto* TPUDevice = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
-    return new TPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi, this->PjrtClient, TPUDevice);
+    // auto* TPUDevice = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
+    return new TPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi, this->PjrtClient, nullptr);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {

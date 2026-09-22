@@ -37,6 +37,9 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/TargetParser/Triple.h"
 
+#define DECLARED_DEVICE_COUNT 1
+#define DEVICE_TYPE "cpu"
+
 using namespace error;
 
 namespace llvm {
@@ -45,22 +48,20 @@ namespace target {
 namespace plugin {
 
 namespace {
-  struct VirPUDeviceImageTy : public DeviceImageTy {
-    VirPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
-                       std::unique_ptr<MemoryBuffer> Image)
-        : DeviceImageTy(ImageId, Device, std::move(Image)) {}
-  };
+struct VPUDeviceImageTy : public DeviceImageTy {
+  VPUDeviceImageTy(int32_t ImageId, GenericDeviceTy &Device,
+                     std::unique_ptr<MemoryBuffer> Image)
+      : DeviceImageTy(ImageId, Device, std::move(Image)) {}
+};
 } // namespace
 
-
 /// Forward declarations for all specialized data structures.
-struct VirPUKernelTy;
-struct VirPUDeviceTy;
-struct VirPUPluginTy;
+struct VPUKernelTy;
+struct VPUDeviceTy;
+struct VPUPluginTy;
 
-
-struct VirPUKernelTy : public GenericKernelTy {
-  VirPUKernelTy(const char *Name) : GenericKernelTy(Name) {}
+struct VPUKernelTy : public GenericKernelTy {
+  VPUKernelTy(const char *Name) : GenericKernelTy(Name) {}
 
   Error initImpl(GenericDeviceTy &GenericDevice,
                  DeviceImageTy &Image) override {
@@ -80,13 +81,13 @@ struct VirPUKernelTy : public GenericKernelTy {
   /// Return maximum block size for maximum occupancy
   Expected<uint64_t> maxGroupSize(GenericDeviceTy &,
                                   uint64_t DynamicMemSize) const override {
-    llvm_unreachable("VirPU Kernel Ty, maxGroupSize!");
+    llvm_unreachable("VPU Kernel Ty, maxGroupSize!");
   }
 };
 
-struct VirPUDeviceTy : public GenericDeviceTy {
-  const PJRT_Api *PjrtApi;
-  PJRT_Client *PjrtCleint;
+struct VPUDeviceTy : public GenericDeviceTy {
+  const PJRT_Api &PjrtApi;
+  // PJRT_Client *PjrtCleint;
   PJRT_Device *PjrtDevice;
 
   struct PjrtBufferContext {
@@ -95,13 +96,14 @@ struct VirPUDeviceTy : public GenericDeviceTy {
     bool IsRealLast;
   };
 
-  VirPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
-                PJRT_Api *Api, PJRT_Client *Client, PJRT_Device *Device)
+  VPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
+                const PJRT_Api &Api, PJRT_Device *Device)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
-        PjrtApi(Api), PjrtCleint(Client), PjrtDevice(Device) {
-  }
+        PjrtApi(Api),
+        // PjrtCleint(Client),
+        PjrtDevice(Device) {}
 
-  ~VirPUDeviceTy() {}
+  ~VPUDeviceTy() {}
 
   /// Initialize the device, its resources and get its properties.
   Error initImpl(GenericPluginTy &Plugin) override { return Plugin::success(); }
@@ -124,14 +126,14 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   }
 
   Expected<GenericKernelTy &> constructKernel(const char *Name) override {
-    VirPUKernelTy *VirPUKernel = Plugin.allocate<VirPUKernelTy>();
-    if (!VirPUKernel)
+    VPUKernelTy *VPUKernel = Plugin.allocate<VPUKernelTy>();
+    if (!VPUKernel)
       return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
-                           "failed to allocate memory for VirPU kernel");
+                           "failed to allocate memory for VPU kernel");
 
-    new (VirPUKernel) VirPUKernelTy(Name);
+    new (VPUKernel) VPUKernelTy(Name);
 
-    return *VirPUKernel;
+    return *VPUKernel;
   }
 
   uint64_t getHardwareParallelism() const override {
@@ -158,7 +160,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     }
 
-    typedef void (*DestroyBufFn)(void *, const PJRT_Api *);
+    typedef void (*DestroyBufFn)(void *, const PJRT_Api &);
     DestroyBufFn DestroyPjrtBufferFn =
         (DestroyBufFn)dlsym(RTLD_DEFAULT, "DestroyPjrtBuffer");
     if (DestroyPjrtBufferFn) {
@@ -173,7 +175,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   /// Synchronize current thread with the pending operations on the async info.
   Error synchronizeImpl(__tgt_async_info &AsyncInfo,
                         bool ReleaseQueue) override {
-    llvm_unreachable("VirPUDeviceTy synchronizeImpl");
+    llvm_unreachable("VPUDeviceTy synchronizeImpl");
     return Plugin::success();
   }
 
@@ -203,6 +205,9 @@ struct VirPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     }
 
+    // TODO: this->PjrtApi.PJRT_Buffer_ToHostBuffer should be called by JForce, not here
+    // Because we can have multiple devices, plugin is not supposed to know this
+
     typedef PJRT_Buffer *(*GetBufFn)(void *);
     GetBufFn GetPjrtBufferFn = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
 
@@ -213,61 +218,61 @@ struct VirPUDeviceTy : public GenericDeviceTy {
           .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
           .src = PjrtBuf,
           .dst = HstPtr,
-          .dst_size = size_t(Size)
-      };
-      auto *Err = this->PjrtApi->PJRT_Buffer_ToHostBuffer(&Args);
+          .dst_size = size_t(Size)};
+      auto *Err = this->PjrtApi.PJRT_Buffer_ToHostBuffer(&Args);
       assert(!Err);
 
       auto AwaitArgs = PJRT_Event_Await_Args{
           .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-          .event = Args.event
-      };
-      auto *Err2 = this->PjrtApi->PJRT_Event_Await(&AwaitArgs);
+          .event = Args.event};
+      auto *Err2 = this->PjrtApi.PJRT_Event_Await(&AwaitArgs);
       assert(!Err2);
     }
 
     return Plugin::success();
   }
 
-  /// Exchange data between two devices directly. We may use peer access if
-  /// the CUDA devices and driver allow them.
+  // Exchange data between two devices directly. We may use peer access if
+  // the CUDA devices and driver allow them.
   Error dataExchangeImpl(const void *SrcPtr, GenericDeviceTy &DstGenericDevice,
                          void *DstPtr, int64_t Size,
-                         AsyncInfoWrapperTy &AsyncInfoWrapper) override;
+                         AsyncInfoWrapperTy &AsyncInfoWrapper) override {
+    llvm_unreachable("VPUDeviceTy dataExchangeImpl");
+  };
 
   Error dataFillImpl(void *TgtPtr, const void *PatternPtr, int64_t PatternSize,
                      int64_t Size,
                      AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    llvm_unreachable("VirPUDeviceTy  dataFillImpl");
+    llvm_unreachable("VPUDeviceTy  dataFillImpl");
   }
 
   /// Initialize the async info for interoperability purposes.
   Error initAsyncInfoImpl(AsyncInfoWrapperTy &AsyncInfoWrapper) override {
-    llvm_unreachable("VirPUDeviceTy initAsyncInfoImpl");
+    llvm_unreachable("VPUDeviceTy initAsyncInfoImpl");
   }
 
   /// Insert a data fence between previous data operations and the following
   /// operations. This is a no-op for CUDA devices as operations inserted into
   /// a queue are in-order.
   Error dataFence(__tgt_async_info *Async) override {
-    llvm_unreachable("VirPUDeviceTy dataFence");
+    llvm_unreachable("VPUDeviceTy dataFence");
     return Plugin::success();
   }
 
   interop_spec_t selectInteropPreference(int32_t InteropType,
                                          int32_t NumPrefers,
                                          interop_spec_t *Prefers) override {
-    llvm_unreachable("VirPUDeviceTy selectInteropPreference");
+    llvm_unreachable("VPUDeviceTy selectInteropPreference");
     return interop_spec_t{tgt_fr_cuda, {true, 0}, 0};
   }
 
   Expected<omp_interop_val_t *>
   createInterop(int32_t InteropType, interop_spec_t &InteropSpec) override {
-    llvm_unreachable("VirPUDeviceTy createInterop");
+    llvm_unreachable("VPUDeviceTy createInterop");
   }
 
   Error releaseInterop(omp_interop_val_t *Interop) override {
-    llvm_unreachable("VirPUDeviceTy releaseInterop");
+    llvm_unreachable("VPUDeviceTy releaseInterop");
     if (!Interop)
       return Plugin::success();
 
@@ -280,7 +285,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
 
   Error enqueueHostCallImpl(void (*Callback)(void *), void *UserData,
                             AsyncInfoWrapperTy &AsyncInfo) override {
-    llvm_unreachable("VirPUDeviceTy enqueueHostCallImpl");
+    llvm_unreachable("VPUDeviceTy enqueueHostCallImpl");
   };
 
   /// Create an event.
@@ -301,7 +306,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
 
   /// Print information about the device.
   Expected<InfoTreeNode> obtainInfoImpl() override {
-    llvm_unreachable("VirPUDeviceTy obtainInfoImpl");
+    llvm_unreachable("VPUDeviceTy obtainInfoImpl");
   }
 
   /// Getters and setters for stack and heap sizes.
@@ -310,7 +315,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
     return Plugin::success();
   }
   Error setDeviceStackSize(uint64_t Value) override {
-    llvm_unreachable("VirPUDeviceTy setDeviceStackSize");
+    llvm_unreachable("VPUDeviceTy setDeviceStackSize");
   }
   bool hasDeviceHeapSize() override { return true; }
   Error getDeviceHeapSize(uint64_t &Value) override {
@@ -318,7 +323,7 @@ struct VirPUDeviceTy : public GenericDeviceTy {
     return Plugin::success();
   }
   Error setDeviceHeapSize(uint64_t Value) override {
-    llvm_unreachable("VirPUDeviceTy setDeviceHeapSize");
+    llvm_unreachable("VPUDeviceTy setDeviceHeapSize");
   }
   Error getDeviceMemorySize(uint64_t &Value) override {
     Value = 80ULL << 30; // 80GB
@@ -326,12 +331,12 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   }
 
   Error getDeviceAttr(uint32_t Kind, uint32_t &Value) {
-    llvm_unreachable("VirPUDeviceTy getDeviceAttr");
+    llvm_unreachable("VPUDeviceTy getDeviceAttr");
   }
 
   /// See GenericDeviceTy::getComputeUnitKind().
   std::string getComputeUnitKind() const override {
-    llvm_unreachable("VirPUDeviceTy getComputeUnitKind");
+    llvm_unreachable("VPUDeviceTy getComputeUnitKind");
   }
 
   /// Returns the clock frequency for the given NVPTX device.
@@ -345,12 +350,12 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   Expected<DeviceImageTy *>
   loadBinaryImpl(std::unique_ptr<MemoryBuffer> &&TgtImage,
                  int32_t ImageId) override {
-    VirPUDeviceImageTy *VirPUImage = Plugin.allocate<VirPUDeviceImageTy>();
-    if (!VirPUImage)
+    VPUDeviceImageTy *VPUImage = Plugin.allocate<VPUDeviceImageTy>();
+    if (!VPUImage)
       return Plugin::error(ErrorCode::OUT_OF_RESOURCES,
-                           "Failed to allocate memory for VirPU Device Image");
-    new (VirPUImage) VirPUDeviceImageTy(ImageId, *this, std::move(TgtImage));
-    return VirPUImage;
+                           "Failed to allocate memory for VPU Device Image");
+    new (VPUImage) VPUDeviceImageTy(ImageId, *this, std::move(TgtImage));
+    return VPUImage;
   }
 
   Error destroyEventImpl(void *EventPtr) override { return Plugin::success(); }
@@ -391,40 +396,40 @@ struct VirPUDeviceTy : public GenericDeviceTy {
   uint32_t HardwareParallelism = 0;
 
 public:
-  Error setContext() override { llvm_unreachable("VirPU setContext"); }
+  Error setContext() override { llvm_unreachable("VPU setContext"); }
 
   Error queryAsyncImpl(__tgt_async_info &AsyncInfo, bool ReleaseQueue,
                        bool *IsQueueWorkCompleted) override {
-    llvm_unreachable("VirPU queryAsyncImpl");
+    llvm_unreachable("VPU queryAsyncImpl");
   }
 
   Expected<void *> dataLockImpl(void *HstPtr, int64_t Size) override {
-    llvm_unreachable("VirPU dataLockImpl");
+    llvm_unreachable("VPU dataLockImpl");
   }
 
   Error dataUnlockImpl(void *HstPtr) override {
-    llvm_unreachable("VirPU dataUnlockImpl");
+    llvm_unreachable("VPU dataUnlockImpl");
   }
 };
 
-Error VirPUKernelTy::delegatedLaunchImpl(
+Error VPUKernelTy::delegatedLaunchImpl(
     GenericDeviceTy &GenericDevice,
     std::function<int64_t(void *)> &DelegatedLaunch,
     AsyncInfoWrapperTy &AsyncInfoWrapper) const {
-  VirPUDeviceTy &VirPUDevice = static_cast<VirPUDeviceTy &>(GenericDevice);
+  VPUDeviceTy &VPUDevice = static_cast<VPUDeviceTy &>(GenericDevice);
   Plugin::DelegatedLaunchArgs DLA{
-      Plugin::DelegatedLaunchArgs::DeviceTyTy::VirPU, &VirPUDevice, nullptr
-      // VirPUPlugin->PjrtClient
+      Plugin::DelegatedLaunchArgs::DeviceTyTy::VPU, &VPUDevice, nullptr
+      // VPUPlugin->PjrtClient
   };
   int64_t Res = DelegatedLaunch(&DLA);
   // std::this_thread::sleep_for(std::chrono::seconds(10));
   if (Res)
     return Plugin::error(ErrorCode::UNSUPPORTED,
-                         "Error in VirPU delegated launch");
+                         "Error in VPU delegated launch");
   return Plugin::success();
 }
 
-Error VirPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
+Error VPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
                                 uint32_t NumThreads[3], uint32_t NumBlocks[3],
                                 uint32_t DynBlockMemSize,
                                 KernelArgsTy &KernelArgs,
@@ -433,7 +438,7 @@ Error VirPUKernelTy::launchImpl(GenericDeviceTy &GenericDevice,
   return Plugin::success();
 }
 
-class VirPUGlobalHandlerTy final : public GenericGlobalHandlerTy {
+class VPUGlobalHandlerTy final : public GenericGlobalHandlerTy {
 public:
   /// Get the metadata of a global from the device. The name and size of the
   /// global is read from DeviceGlobal and the address of the global is written
@@ -445,11 +450,8 @@ public:
   }
 };
 
-#define DECLARED_DEVICE_COUNT 1
-#define DEVICE_TYPE "cpu"
-
-struct VirPUPluginTy final : public GenericPluginTy {
-  // Although claimed to only have one device, VirPUPluginTy actually manage
+struct VPUPluginTy final : public GenericPluginTy {
+  // Although claimed to only have one device, VPUPluginTy actually manage
   // multiple devices, which forms a device mesh. Devices can be logically
   // formed as a multi-dimensional mesh. i.e., a 2x3 mesh means we have 6
   // devices and logically formed as a 2 row 3 column matrix.
@@ -459,11 +461,11 @@ struct VirPUPluginTy final : public GenericPluginTy {
   PJRT_Api *PjrtApi;
   PJRT_Client *PjrtClient = nullptr;
 
-  VirPUPluginTy() : GenericPluginTy(getTripleArch()) {}
+  VPUPluginTy() : GenericPluginTy(getTripleArch()) {}
 
   /// This class should not be copied.
-  VirPUPluginTy(const VirPUPluginTy &) = delete;
-  VirPUPluginTy(VirPUPluginTy &&) = delete;
+  VPUPluginTy(const VPUPluginTy &) = delete;
+  VPUPluginTy(VPUPluginTy &&) = delete;
 
   std::string getDeviceDescription(const PJRT_Api *api, PJRT_Device *device) {
     PJRT_Device_GetDescription_Args args = {
@@ -488,14 +490,15 @@ struct VirPUPluginTy final : public GenericPluginTy {
   }
 
   // WARN: this only return a sincle device
-  // This practically return the first PjrtDevice found satisfying the description, even there are multiple devices.
+  // This practically return the first PjrtDevice found satisfying the
+  // description, even there are multiple devices.
   PJRT_Device *findDevice(const PJRT_Api *PjrtApi, PJRT_Client *PjrtClient,
                           const std::string &DeviceDescKeyword) {
     PJRT_Client_AddressableDevices_Args DeviceArgs = {
         .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
         .client = PjrtClient,
     };
-    auto* Err = PjrtApi->PJRT_Client_AddressableDevices(&DeviceArgs);
+    auto *Err = PjrtApi->PJRT_Client_AddressableDevices(&DeviceArgs);
     if (Err || DeviceArgs.num_addressable_devices < 1) {
       std::cerr << "no devices found!\n";
       return nullptr;
@@ -524,7 +527,7 @@ struct VirPUPluginTy final : public GenericPluginTy {
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
-    const char *CustomPath = std::getenv("LIBVirPU_PATH");
+    const char *CustomPath = std::getenv("LIBVPU_PATH");
     void *Handle = nullptr;
     if (CustomPath != nullptr) {
       Handle = dlopen(CustomPath, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
@@ -532,7 +535,7 @@ struct VirPUPluginTy final : public GenericPluginTy {
       Handle = dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     }
     if (!Handle) {
-      printf("VirPU plugin not found, fall back to CPU!\n");
+      printf("VPU plugin not found, fall back to CPU!\n");
       return 0;
     }
     // follow the example of `man dlopen`
@@ -560,9 +563,8 @@ struct VirPUPluginTy final : public GenericPluginTy {
       PJRT_Plugin_Initialize_Args InitArgs = {};
       InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
       auto *InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
-      PJRT_Client_Create_Args args = {
-        .struct_size = PJRT_Client_Create_Args_STRUCT_SIZE
-      };
+      PJRT_Client_Create_Args args = {.struct_size =
+                                          PJRT_Client_Create_Args_STRUCT_SIZE};
       auto *error = Api->PJRT_Client_Create(&args);
       if (error) {
         std::cerr << "Fail to create client!\n";
@@ -582,14 +584,14 @@ struct VirPUPluginTy final : public GenericPluginTy {
 
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
-    PJRT_Device *VirPUDevice =
+    PJRT_Device *VPUDevice =
         findDevice(this->PjrtApi, this->PjrtClient, DEVICE_TYPE);
-    return new VirPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi,
-                             this->PjrtClient, VirPUDevice);
+    return new VPUDeviceTy(Plugin, DeviceId, NumDevices, *(this->PjrtApi),
+                             VPUDevice);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {
-    return new VirPUGlobalHandlerTy();
+    return new VPUGlobalHandlerTy();
   }
 
   /// Get the ELF code for recognizing the compatible image binary.
@@ -597,8 +599,9 @@ struct VirPUPluginTy final : public GenericPluginTy {
 
   Triple::ArchType getTripleArch() const override {
     // We actually use x86 here, it does not matter as we will jit execute code
-    // rather than compile to VirPU target in LLVM
-    return Triple::x86_64;
+    // rather than compile to VPU target in LLVM
+    // INFO: DO NOT USE THIS FOR NOW. USE TPU PLUGIN INSTEAD.
+    return Triple::arm;
   }
 
   const char *getName() const override { return GETNAME(TARGET_NAME); }
@@ -642,11 +645,11 @@ private:
   }
 };
 
-// Error VirPUDeviceTy::dataExchangeImpl(const void *SrcPtr,
+// Error VPUDeviceTy::dataExchangeImpl(const void *SrcPtr,
 //                                      GenericDeviceTy &DstGenericDevice,
 //                                      void *DstPtr, int64_t Size,
 //                                      AsyncInfoWrapperTy &AsyncInfoWrapper) {
-//   llvm_unreachable("VirPUDeviceTy::dataExchangeImpl");
+//   llvm_unreachable("VPUDeviceTy::dataExchangeImpl");
 // }
 
 // template <typename... ArgsTy>
@@ -663,6 +666,6 @@ private:
 extern "C" {
 // BUG: this function not created yet
 llvm::omp::target::plugin::GenericPluginTy *createPlugin_vpu() {
-  return new llvm::omp::target::plugin::VirPUPluginTy();
+  return new llvm::omp::target::plugin::VPUPluginTy();
 }
 }
