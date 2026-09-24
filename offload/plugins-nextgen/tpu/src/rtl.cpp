@@ -302,28 +302,33 @@ struct TPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     }
 
-    typedef PJRT_Buffer* (*GetBufFn)(void*);
-    GetBufFn get_buf = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
+    typedef void (*RetriveDataFn)(void*, int64_t);
+    RetriveDataFn RetrieveData = (RetriveDataFn)dlsym(RTLD_DEFAULT, "RetrieveData");
+    // TgtPtr is a forged pointer, still on host side
+    RetrieveData(const_cast<void*>(TgtPtr), (size_t)Size);
+    std::memcpy(HstPtr, TgtPtr, static_cast<size_t>(Size));
 
-    PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
-    if (PjrtBuf) {
-      // Can not use `PJRT_Buffer_CopyRawToHost`, the result would be weird.
-      auto args = PJRT_Buffer_ToHostBuffer_Args{
-        .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
-        .src = PjrtBuf,
-        .dst = HstPtr,
-        .dst_size = size_t(Size)
-      };
-      auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
-      assert(!err);
-
-      auto awaitArgs = PJRT_Event_Await_Args{
-        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-        .event = args.event
-      };
-      auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-      assert(!err2);
-    }
+    // typedef PJRT_Buffer* (*GetBufFn)(void*);
+    // GetBufFn get_buf = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
+    // PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
+    // if (PjrtBuf) {
+    //   // Can not use `PJRT_Buffer_CopyRawToHost`, the result would be weird.
+    //   auto args = PJRT_Buffer_ToHostBuffer_Args{
+    //     .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
+    //     .src = PjrtBuf,
+    //     .dst = HstPtr,
+    //     .dst_size = size_t(Size)
+    //   };
+    //   auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
+    //   assert(!err);
+    //
+    //   auto awaitArgs = PJRT_Event_Await_Args{
+    //     .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
+    //     .event = args.event
+    //   };
+    //   auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
+    //   assert(!err2);
+    // }
 
     return Plugin::success();
    }
