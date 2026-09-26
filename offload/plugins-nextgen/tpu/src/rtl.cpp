@@ -20,32 +20,22 @@
 #include <iostream>
 #include <string>
 #include "../dynamic_tpu/pjrt_c_api.h"
-#include <unordered_map>
 
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
-#include "Shared/Environment.h"
 
 #include "GlobalHandler.h"
-#include "OpenMP/OMPT/Callback.h"
 #include "PluginInterface.h"
-#include "Utils/ELF.h"
 #include "omptarget.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/BinaryFormat/ELF.h"
-#include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPGridValues.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/FileOutputBuffer.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/MathExtras.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
-#include "llvm/Transforms/Utils/FunctionComparator.h"
 
 using namespace error;
 
@@ -127,9 +117,6 @@ struct TPUEventRef final : public GenericDeviceResourceRef {
 };
 
 struct TPUDeviceTy : public GenericDeviceTy {
-  const PJRT_Api* pjrtApi;
-  PJRT_Client* pjrtCleint;
-  // PJRT_Device* pjrtDevice;
 
   struct PjrtBufferContext {
     PJRT_Buffer* PjrtBuf;
@@ -137,12 +124,8 @@ struct TPUDeviceTy : public GenericDeviceTy {
     bool isRealLast; 
   };
 
-  TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices,
-              PJRT_Api* Api, PJRT_Client* Client, PJRT_Device* Device)
-      : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues),
-        pjrtApi(Api), pjrtCleint(Client) {
-    // printf("\nTPUDeviceTy init success!\n");
-  }
+  TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices)
+      : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues) {}
 
   TPUDeviceTy(GenericPluginTy &Plugin) 
     : GenericDeviceTy(Plugin, 0, 1, NVPTXGridValues) {}
@@ -228,10 +211,10 @@ struct TPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     }
 
-    typedef void (*DestroyBufFn)(void*, const PJRT_Api*);
+    typedef void (*DestroyBufFn)(void*);
     DestroyBufFn destroy_buf = (DestroyBufFn)dlsym(RTLD_DEFAULT, "DestroyPjrtBuffer");
     if (destroy_buf) {
-        destroy_buf(TgtPtr, this->pjrtApi);
+        destroy_buf(TgtPtr);
     } else {
         std::cerr << "Warning: DestroyPjrtBuffer not found in executor.\n";
     }
@@ -307,29 +290,6 @@ struct TPUDeviceTy : public GenericDeviceTy {
     // TgtPtr is a forged pointer, still on host side
     RetrieveData(const_cast<void*>(TgtPtr), (size_t)Size);
     std::memcpy(HstPtr, TgtPtr, static_cast<size_t>(Size));
-
-    // typedef PJRT_Buffer* (*GetBufFn)(void*);
-    // GetBufFn get_buf = (GetBufFn)dlsym(RTLD_DEFAULT, "GetPjrtBuffer");
-    // PJRT_Buffer* PjrtBuf = get_buf(const_cast<void*>(TgtPtr));
-    // if (PjrtBuf) {
-    //   // Can not use `PJRT_Buffer_CopyRawToHost`, the result would be weird.
-    //   auto args = PJRT_Buffer_ToHostBuffer_Args{
-    //     .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
-    //     .src = PjrtBuf,
-    //     .dst = HstPtr,
-    //     .dst_size = size_t(Size)
-    //   };
-    //   auto* err = this->pjrtApi->PJRT_Buffer_ToHostBuffer(&args);
-    //   assert(!err);
-    //
-    //   auto awaitArgs = PJRT_Event_Await_Args{
-    //     .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE,
-    //     .event = args.event
-    //   };
-    //   auto* err2 = this->pjrtApi->PJRT_Event_Await(&awaitArgs);
-    //   assert(!err2);
-    // }
-
     return Plugin::success();
    }
 
@@ -541,73 +501,11 @@ public:
 };
 
 struct TPUPluginTy final : public GenericPluginTy {
-  PJRT_Api* PjrtApi;
-  PJRT_Client* PjrtClient = nullptr;
-
   TPUPluginTy() : GenericPluginTy(getTripleArch()) {}
 
   /// This class should not be copied.
   TPUPluginTy(const TPUPluginTy &) = delete;
   TPUPluginTy(TPUPluginTy &&) = delete;
-
-
-  std::string getDeviceDescription(const PJRT_Api *api, PJRT_Device *device) {
-    PJRT_Device_GetDescription_Args args = {
-      .struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE,
-      .device = device,
-    };
-    auto err1 = api->PJRT_Device_GetDescription(&args);
-    if (err1) {
-      std::cerr << "Error in getting description!\n";
-      return nullptr;
-    }
-    PJRT_DeviceDescription_ToString_Args ts_args = {
-      .struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE,
-      .device_description = args.device_description,
-    };
-    auto err2 = api->PJRT_DeviceDescription_ToString(&ts_args);
-    if (err2) {
-      std::cerr << "Error in getting description to string!\n";
-      return nullptr;
-    }
-    return ts_args.to_string;
-  }
-
-  // Get the target device handle
-  PJRT_Device *findDevice(
-    const PJRT_Api *api, 
-    PJRT_Client *client,
-    const std::string &deviceDescKeyword
-  ) {
-    PJRT_Client_AddressableDevices_Args device_args = {
-      .struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE,
-      .client = client,
-    };
-    auto err = api->PJRT_Client_AddressableDevices(&device_args);
-    if (err || device_args.num_addressable_devices < 1) {
-      std::cerr << "no devices found!\n"; 
-      return nullptr;
-    }
-
-    int chosen_device_idx = -1;
-    std::string desc = ""; // for logging purpose
-    for (int i = 0; i < device_args.num_addressable_devices; i++) {
-      std::string tmp = getDeviceDescription(api, device_args.addressable_devices[i]);
-      llvm::dbgs() << "We're getting description like: " << tmp << "\n" ;
-      std::transform(tmp.begin(), tmp.end(), tmp.begin(),[](unsigned char c) { return std::tolower(c); });
-      if (tmp.find(deviceDescKeyword) != std::string::npos) {
-        chosen_device_idx = i;
-        desc = tmp;
-        break;
-      }
-    }
-    if (chosen_device_idx == -1) {
-      std::cerr << "no device found, but why?!\n";
-      return nullptr;
-    }
-    return device_args.addressable_devices[chosen_device_idx];
-  }
-
 
   /// Initialize the plugin and return the number of devices.
   Expected<int32_t> initImpl() override {
@@ -619,50 +517,7 @@ struct TPUPluginTy final : public GenericPluginTy {
       llvm::errs() << "Should assign a PJRT plugin!\n";
       std::exit(EXIT_FAILURE);
     }
-
-    // const char* custom_path = std::getenv("LIBTPU_PATH");
-    // void* Handle = nullptr;
-    // if (custom_path != nullptr) {
-    //   Handle =  dlopen(custom_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-    // } else {
-    //   Handle =  dlopen("libtpu.so", RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-    // }
-    // if (!Handle) {
-    //   printf("TPU plugin not found, fall back to CPU!\n");
-    //   return 0;
-    // }
-    // follow the example of `man dlopen`
-    auto GetApiFn = (PJRT_Api * (*)()) dlsym(Handle, "GetPjrtApi");
-    if (!GetApiFn) {
-      std::cerr << "error finding GetPjrtApi: " << dlerror() << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    PJRT_Api* Api = GetApiFn();
-    assert(Api && "Can not get APi!");
-    PJRT_Plugin_Initialize_Args InitArgs = {};
-    InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-    auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
     // Theoretically need to close handle_ when exiting, but it will automatically be destroyed when exiting the program so intentionally leave it.
-    this->PjrtApi = Api;
-    
-    typedef PJRT_Client* (*GetClientFn)();
-    GetClientFn get_client = (GetClientFn)dlsym(RTLD_DEFAULT, "GetExecutorPJRTClient");
-    if (get_client) {
-      this->PjrtClient = get_client();
-    } else {
-      PJRT_Plugin_Initialize_Args InitArgs = {};
-      InitArgs.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-      auto* InitErr = Api->PJRT_Plugin_Initialize(&InitArgs);
-      PJRT_Client_Create_Args args = {
-        .struct_size= PJRT_Client_Create_Args_STRUCT_SIZE
-      };
-      auto* error = Api->PJRT_Client_Create(&args);
-      if (error) {
-        std::cerr << "Fail to create client!\n";
-        std::exit(EXIT_FAILURE);
-      }
-      this->PjrtClient = args.client;
-    }
     return 1;
   }
 
@@ -673,7 +528,7 @@ struct TPUPluginTy final : public GenericPluginTy {
   GenericDeviceTy *createDevice(GenericPluginTy &Plugin, int32_t DeviceId,
                                 int32_t NumDevices) override {
     // auto* TPUDevice = findDevice(this->PjrtApi, this->PjrtClient, "tpu");
-    return new TPUDeviceTy(Plugin, DeviceId, NumDevices, this->PjrtApi, this->PjrtClient, nullptr);
+    return new TPUDeviceTy(Plugin, DeviceId, NumDevices);
   }
 
   GenericGlobalHandlerTy *createGlobalHandler() override {
