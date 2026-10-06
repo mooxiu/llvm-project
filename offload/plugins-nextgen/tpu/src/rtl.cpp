@@ -19,8 +19,8 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <string>
-#include "../dynamic_tpu/pjrt_c_api.h"
 
+#include "OffloadError.h"
 #include "Shared/APITypes.h"
 #include "Shared/Debug.h"
 
@@ -118,11 +118,11 @@ struct TPUEventRef final : public GenericDeviceResourceRef {
 
 struct TPUDeviceTy : public GenericDeviceTy {
 
-  struct PjrtBufferContext {
-    PJRT_Buffer* PjrtBuf;
-    PJRT_AsyncHostToDeviceTransferManager* TransferManager;
-    bool isRealLast; 
-  };
+  // struct PjrtBufferContext {
+  //   PJRT_Buffer* PjrtBuf;
+  //   PJRT_AsyncHostToDeviceTransferManager* TransferManager;
+  //   bool isRealLast; 
+  // };
 
   TPUDeviceTy(GenericPluginTy &Plugin, int32_t DeviceId, int32_t NumDevices)
       : GenericDeviceTy(Plugin, DeviceId, NumDevices, NVPTXGridValues) {}
@@ -274,6 +274,16 @@ struct TPUDeviceTy : public GenericDeviceTy {
       return Plugin::success();
     // Creating buffer will happen on jit-code-executor side.
     memcpy(TgtPtr, HstPtr, Size);
+    // invalidate buffer cache, because of MemoryManagerTy, it can reuse memory pool without allocate on device.
+    // pass size for check purpose only.
+    using InvalidateFn = bool (*)(void*, int64_t);
+    auto InvalidateBuffer = (InvalidateFn)dlsym(RTLD_DEFAULT, "InvalidateBuffer");
+    if (!InvalidateBuffer) {
+      return Plugin::error(error::ErrorCode::UNIMPLEMENTED, "InvalidateBuffer is not found!");
+    }
+    if (!InvalidateBuffer(TgtPtr, Size)) {
+      return Plugin::error(error::ErrorCode::INVALID_EVENT, "Fail to invalidate tgtPtr, this might cause data corruption!\n");
+    }
     return Plugin::success();
   }
 
