@@ -115,6 +115,7 @@ def MaterializePrivates: Pass<"materialize-privates", "::mlir::ModuleOp"> {
 
 def FlattenOpenMPTarget : Pass<"flatten-target", "::mlir::ModuleOp"> {
   let summary = "Flatten openmp target";
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
 }
 
 def GenericLoopConversionPass

@@ -457,64 +457,66 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     return val;
   };
 
-  // FIX: should actually translate into something like scf::ParallelOp as
-  // wsloop means a prallel execution rather than serial loops.
-  LogicalResult replaceNestLoopOp(omp::LoopNestOp op, PatternRewriter &rewriter,
-                                  bool isParalleled) const {
+  LogicalResult replaceNestLoopOp(omp::LoopNestOp op,
+                                  PatternRewriter &rewriter) const {
+
     if (!op.getLoopInclusive())
       return rewriter.notifyMatchFailure(op, "non-inclusive loop unsupported");
     if (!op.getRegion().hasOneBlock())
       return rewriter.notifyMatchFailure(op, "multi-block loop unsupported");
 
-    // OpBuilder::InsertionGuard guard(rewriter);
-    // Operation* container = op -> getParentOp();
-    // assert(container->getNumRegions() == 1);
-    // assert(container->getRegion(0).hasOneBlock());
-    // Block& containerBlock = container->getRegion(0).getBlocks().front();
-
     Location loc = op.getLoc();
     llvm::SmallVector<mlir::Value> newInductionVars;
 
-    // TODO: if (!isParalleled) {
-    fir::DoLoopOp outmostLoopOp = nullptr;
-    fir::DoLoopOp lastLoopOp = nullptr;
-    // from outmost to innermost
-    for (uint64_t i = 0; i < op.getCollapseNumLoops(); i++) {
-      rewriter.setInsertionPoint(outmostLoopOp? outmostLoopOp.getOperation() : op.getOperation());
-      auto lb = convertToIndexIfNot(op.getLoopLowerBounds()[i], loc, rewriter);
-      auto ub = convertToIndexIfNot(op.getLoopUpperBounds()[i], loc, rewriter);
-      auto step = convertToIndexIfNot(op.getLoopSteps()[i], loc, rewriter);
-
-      if (!outmostLoopOp) {
-        rewriter.setInsertionPoint(op);
-      } else {
-        rewriter.setInsertionPointToStart(lastLoopOp.getBody());
-      }
-      auto loopOp = fir::DoLoopOp::create(rewriter, op.getLoc(), lb, ub, step);
-      if (outmostLoopOp == nullptr) {
-        outmostLoopOp = loopOp;
-      }
-      lastLoopOp = loopOp;
-      newInductionVars.push_back(loopOp.getInductionVar());
+    rewriter.setInsertionPoint(op);
+    llvm::SmallVector<Value> lbs, steps, tripCounts;
+    for (unsigned i = 0; i < op.getCollapseNumLoops(); i++) {
+      Value lb = convertToIndexIfNot(op.getLoopLowerBounds()[i], loc, rewriter);
+      Value ub = convertToIndexIfNot(op.getLoopUpperBounds()[i], loc, rewriter);
+      Value step = convertToIndexIfNot(op.getLoopSteps()[i], loc, rewriter);
+      // tripCount = (ub - lb + step)/step
+      Value tc = arith::DivSIOp::create(
+          rewriter, loc,
+          arith::AddIOp::create(rewriter, loc,
+                                arith::SubIOp::create(rewriter, loc, ub, lb),
+                                step),
+          step);
+      lbs.push_back(lb);
+      steps.push_back(step);
+      tripCounts.push_back(tc);
     }
 
-    assert(lastLoopOp);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    llvm::SmallVector<Value> zeros(tripCounts.size(), zero);
+    llvm::SmallVector<Value> ones(tripCounts.size(), one);
+    auto scfParallelOp =
+        scf::ParallelOp::create(rewriter, loc, zeros, tripCounts, ones);
 
-    auto *targetBlock = lastLoopOp.getBody();
+    // Move Fir Loop to ScfParallelOp
+    rewriter.setInsertionPointToStart(scfParallelOp.getBody());
+    for (auto [scfIv, lb, step, origIv] :
+         llvm::zip(scfParallelOp.getInductionVars(), lbs, steps,
+                   op.getRegion().front().getArguments())) {
+      // Affine transformation to recover iv of fir:
+      // fir: (lb, ub, step)
+      // scf: (0, tc, 1)
+      // so: iv = lb + i * step
+      Value iv = arith::AddIOp::create(
+          rewriter, loc, lb, arith::MulIOp::create(rewriter, loc, scfIv, step));
+      if (iv.getType() != origIv.getType()) {
+        iv = fir::ConvertOp::create(rewriter, loc, origIv.getType(), iv);
+      }
+      newInductionVars.push_back(iv);
+    }
+
+    auto *targetBlock = scfParallelOp.getBody();
     auto *sourceBlock = &op.getRegion().front();
-
     rewriter.eraseOp(sourceBlock->getTerminator());
-
     rewriter.inlineBlockBefore(sourceBlock, targetBlock,
                                targetBlock->getTerminator()->getIterator(),
                                newInductionVars);
-
     rewriter.eraseOp(op);
-    // if (container && container->getDiscardableAttr("omp.composite")) {
-    //   rewriter.modifyOpInPlace(container, [&]{
-    //     container->removeDiscardableAttr("omp.composite");
-    //   });
-    // }
     return success();
   }
 
@@ -527,11 +529,10 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
       return rewriter.notifyMatchFailure(op,
                                          "outer loop_nest not flattened yet");
     }
-
-    bool isParalleled = llvm::any_of(wrappers, [&](auto *wrapper) {
-      return llvm::isa<omp::WsloopOp>(wrapper);
-    });
-    if (replaceNestLoopOp(op, rewriter, isParalleled).failed()) {
+    // According to OpenMP Dialect, the parent of LoopNestOp must be another
+    // wrapper, all with parallelism semantics.
+    // TODO: check if there is a clause prevent parallelism
+    if (replaceNestLoopOp(op, rewriter).failed()) {
       return failure();
     }
     for (auto *wrapper : wrappers) {
