@@ -85,6 +85,13 @@ module {
   // SL-ASSIGN-NOT: omp.distribute
   // SL-ASSIGN-NOT: omp.wsloop
   // SL-ASSIGN-NOT: omp.loop_nest
+  // The private copy of `i` is per iteration: created in the loop body,
+  // uninitialized (type = private), and its declare is moved in with it.
+  // SL-ASSIGN-NOT: fir.alloca
+  // SL-ASSIGN: scf.parallel
+  // SL-ASSIGN-NEXT: %[[I:.*]] = fir.alloca i32
+  // SL-ASSIGN-NEXT: %[[DECL:.*]]:2 = hlfir.declare %[[I]] {uniq_name = "_QFFrun_benchmarkEi"}
+  // SL-ASSIGN: hlfir.assign %{{.*}} to %[[DECL]]#0 : i32
     omp.target host_eval(%c1_i32 -> %arg3, %20 -> %arg4, %c1_i32_1 -> %arg5 : i32, i32, i32) map_entries(%21 -> %arg6, %22 -> %arg7, %25 -> %arg8, %28 -> %arg9, %29 -> %arg10, %30 -> %arg11 : !fir.ref<i32>, !fir.ref<i32>, !fir.ref<!fir.array<?xf64>>, !fir.ref<!fir.array<?xf64>>, !fir.ref<i32>, !fir.ref<i32>) {
       %31 = fir.load %arg11 : !fir.ref<i32>
       %32 = fir.load %arg10 : !fir.ref<i32>
@@ -256,6 +263,12 @@ module{
           // DL-ASSIGN-NOT: omp.distribute
           // DL-ASSIGN-NOT: omp.wsloop
           // DL-ASSIGN-NOT: omp.loop_nest
+          // DL-ASSIGN-NOT: fir.alloca
+          // DL-ASSIGN: scf.parallel
+          // DL-ASSIGN-NEXT: %[[I:.*]] = fir.alloca i32
+          // DL-ASSIGN-NEXT: %[[J:.*]] = fir.alloca i32
+          // DL-ASSIGN-NEXT: hlfir.declare %[[I]] {uniq_name = "_QFFrun_benchmarkEi"}
+          // DL-ASSIGN-NEXT: hlfir.declare %[[J]] {uniq_name = "_QFFrun_benchmarkEj"}
           omp.distribute {
             omp.wsloop {
               omp.loop_nest (%arg17) : i32 = (%arg3) to (%arg4) inclusive step (%arg5) {

@@ -17,10 +17,10 @@ module {
     // NESTED: omp.target
     // NESTED-NOT: omp.teams
     // NESTED-NOT: omp.distribute
-    // NESTED: fir.do_loop
+    // NESTED: scf.parallel
     // NESTED-NOT: omp.parallel
     // NESTED-NOT: omp.wsloop
-    // NESTED: fir.do_loop
+    // NESTED: scf.parallel
     // NESTED: fir.coordinate_of
     // NESTED: fir.store
     // NESTED-NOT: omp.loop_nest
@@ -89,14 +89,13 @@ module {
     // NESTED-RED: [[TEAMS_ACC:%[^ ]+]] = fir.alloca f64
     // NESTED-RED: fir.store %{{.*}} to [[TEAMS_ACC]]
     // ic loop
-    // NESTED-RED: fir.do_loop
+    // NESTED-RED: scf.parallel
     // NESTED-RED: fir.store %{{.*}} to [[E2T]]
     // The wsloop reduction gets its own accumulator inside the ic loop.
     // NESTED-RED: [[WS_ACC:%[^ ]+]] = fir.alloca f64
     // NESTED-RED: fir.store %{{.*}} to [[WS_ACC]]
-    // ib and ia loops (collapse(2))
-    // NESTED-RED: fir.do_loop
-    // NESTED-RED: fir.do_loop
+    // ib and ia loops (collapse(2)): one 2-D loop
+    // NESTED-RED: scf.parallel (%{{[^,]+}}, %{{[^)]+}})
     // NESTED-RED: fir.load [[WS_ACC]]
     // NESTED-RED: arith.addf
     // NESTED-RED: fir.store %{{.*}} to [[WS_ACC]]

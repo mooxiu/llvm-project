@@ -1,7 +1,10 @@
 // Regressional Test: flang/test/Transforms/OpenMP/flatten-target.mlir
 
 #include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/HLFIR/HLFIROps.h"
 #include "flang/Optimizer/OpenMP/Passes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -37,11 +40,6 @@ namespace flangomp {
 #define DEBUG_TYPE "flatten-target"
 
 using namespace mlir;
-
-static unsigned getPrivateOffset(Operation *wrapper) {
-  // FIX: IMPLEMENT ME
-  return 0;
-}
 
 static unsigned getHostEvalVarsOffset(Operation *wrapper) {
   if (auto targetOp = llvm::dyn_cast<omp::TargetOp>(wrapper)) {
@@ -273,13 +271,93 @@ struct MapHostEvalPattern : public OpRewritePattern<omp::TargetOp> {
   }
 };
 
+static omp::PrivateClauseOp getPrivateRecipe(Operation *wrapper,
+                                             unsigned index) {
+  auto syms = wrapper->getAttrOfType<ArrayAttr>("private_syms");
+  assert(syms && index < syms.size());
+  return SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
+      wrapper, cast<SymbolRefAttr>(syms[index]));
+}
+
+// Checks that the private variables of `wrappers` can get one copy per
+// iteration of the parallel loop, and collects the ops that must move into the
+// loop body with them.
+//
+// Every private block argument is replaced by an alloca inside the loop body.
+// Its users outside the loop (e.g. the hlfir.declare of the private copy in an
+// omp.parallel block) would then use a value that does not dominate them, so
+// they move into the loop body too. They used to run once per thread and will
+// run once per iteration, which is only equivalent if they have no side
+// effects.
+static LogicalResult
+collectPrivateUsesToMove(omp::LoopNestOp loop, ArrayRef<Operation *> wrappers,
+                         llvm::SetVector<Operation *> &toMove) {
+  llvm::SmallVector<Value> worklist;
+  for (Operation *wrapper : wrappers) {
+    auto iface = dyn_cast<omp::BlockArgOpenMPOpInterface>(wrapper);
+    if (!iface) {
+      return wrapper->emitError("unsupported OpenMP loop wrapper");
+    }
+    for (auto [i, arg] : llvm::enumerate(iface.getPrivateBlockArgs())) {
+      omp::PrivateClauseOp recipe = getPrivateRecipe(wrapper, i);
+      Type type = recipe.getType();
+      // Only scalars for now: their copy is a plain alloca (+ load/store for
+      // firstprivate). Others need the init/copy/dealloc regions.
+      if (!recipe.getInitRegion().empty() ||
+          !recipe.getDeallocRegion().empty() ||
+          !(type.isIntOrIndexOrFloat() || isa<fir::LogicalType>(type))) {
+        return recipe.emitError("only scalar private variables are supported");
+      }
+      worklist.push_back(arg);
+    }
+  }
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    for (Operation *user : value.getUsers()) {
+      if (loop->isAncestor(user) || toMove.contains(user)) {
+        continue;
+      }
+      // A nested wrapper may privatize this value again; that wrapper's
+      // private copy is built inside the loop body.
+      if (llvm::is_contained(wrappers, user)) {
+        auto iface = cast<omp::BlockArgOpenMPOpInterface>(user);
+        if (!llvm::is_contained(iface.getPrivateVars(), value)) {
+          return user->emitError(
+              "private variable used by a clause other than private");
+        }
+        continue;
+      }
+      Operation *loopInBlock =
+          user->getBlock()->findAncestorOpInBlock(*loop.getOperation());
+      bool beforeLoop = llvm::is_contained(wrappers, user->getParentOp()) &&
+                        loopInBlock && user->isBeforeInBlock(loopInBlock);
+      bool pure = isa<hlfir::DeclareOp, fir::DeclareOp>(user) ||
+                  (user->getNumRegions() == 0 && isMemoryEffectFree(user));
+      if (!beforeLoop || !pure) {
+        return user->emitError(
+            "cannot move this use of a private variable into the loop");
+      }
+      toMove.insert(user);
+      for (Value result : user->getResults()) {
+        worklist.push_back(result);
+      }
+    }
+  }
+  return success();
+}
+
+// Replaces each private block argument by a fresh copy created at the current
+// insertion point, which the caller puts in the loop body so that every
+// iteration gets its own copy. `private` copies start uninitialized;
+// `firstprivate` copies start with the value of the original variable.
 template <typename T>
 static void materializePrivatesImpl(T op, PatternRewriter &rewriter) {
   auto iface = dyn_cast<omp::BlockArgOpenMPOpInterface>(op.getOperation());
   if (!iface)
     return;
 
-  auto offset = getPrivateOffset(op);
+  auto offset = iface.getPrivateBlockArgsStart();
   if (iface.numPrivateBlockArgs() == 0) {
     return;
   }
@@ -287,26 +365,18 @@ static void materializePrivatesImpl(T op, PatternRewriter &rewriter) {
   auto privateVarNum = iface.numPrivateBlockArgs();
   auto loc = iface->getLoc();
 
-  Block &entryBlock = op->getRegion(0).getBlocks().front();
   for (unsigned i = 0; i < privateVarNum; i++) {
     auto privateVar = iface.getPrivateVars()[i];
-    auto arg = entryBlock.getArgument(offset + i);
+    auto arg = iface.getPrivateBlockArgs()[i];
+    omp::PrivateClauseOp recipe = getPrivateRecipe(op.getOperation(), i);
 
-    auto privateSyms = op.getPrivateSyms();
-    assert(privateSyms);
-    auto symbol = llvm::dyn_cast<SymbolRefAttr>(privateSyms->getValue()[i]);
-    assert(symbol);
-
-    auto recipe = SymbolTable::lookupNearestSymbolFrom<omp::PrivateClauseOp>(
-        iface, symbol);
-    auto kind = recipe.getDataSharingType();
-    Type type = recipe.getType();
-    // materializePrivate(kind, type, privateVar, arg);
-    // FIXME: should use recipe, kind and type, but only consider scalar for now
-    rewriter.setInsertionPointToStart(&entryBlock);
-    auto loadOp = fir::LoadOp::create(rewriter, loc, privateVar);
-    auto local = fir::AllocaOp::create(rewriter, loc, type);
-    fir::StoreOp::create(rewriter, loc, loadOp.getResult(), local.getResult());
+    auto local = fir::AllocaOp::create(rewriter, loc, recipe.getType());
+    if (recipe.getDataSharingType() ==
+        omp::DataSharingClauseType::FirstPrivate) {
+      auto loadOp = fir::LoadOp::create(rewriter, loc, privateVar);
+      fir::StoreOp::create(rewriter, loc, loadOp.getResult(),
+                           local.getResult());
+    }
     rewriter.replaceAllUsesWith(arg, local.getResult());
   }
 
@@ -457,8 +527,8 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     return val;
   };
 
-  LogicalResult replaceNestLoopOp(omp::LoopNestOp op,
-                                  PatternRewriter &rewriter) const {
+  FailureOr<scf::ParallelOp> replaceNestLoopOp(omp::LoopNestOp op,
+                                               PatternRewriter &rewriter) const {
 
     if (!op.getLoopInclusive())
       return rewriter.notifyMatchFailure(op, "non-inclusive loop unsupported");
@@ -517,7 +587,7 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
                                targetBlock->getTerminator()->getIterator(),
                                newInductionVars);
     rewriter.eraseOp(op);
-    return success();
+    return scfParallelOp;
   }
 
   LogicalResult matchAndRewrite(omp::LoopNestOp op,
@@ -532,11 +602,34 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     // According to OpenMP Dialect, the parent of LoopNestOp must be another
     // wrapper, all with parallelism semantics.
     // TODO: check if there is a clause prevent parallelism
-    if (replaceNestLoopOp(op, rewriter).failed()) {
+    llvm::SetVector<Operation *> toMove;
+    if (failed(collectPrivateUsesToMove(op, wrappers, toMove))) {
       return failure();
     }
-    for (auto *wrapper : wrappers) {
+    FailureOr<scf::ParallelOp> loop = replaceNestLoopOp(op, rewriter);
+    if (failed(loop)) {
+      return failure();
+    }
+
+    // Build the private copies inside the loop body, outer wrappers first, and
+    // move the ops that use them in after them. The body then starts with
+    //   [outer copies][outer moved ops][inner copies][inner moved ops][iv]...
+    // so every copy and moved op comes after the values it uses.
+    Operation *bodyStart = &loop->getBody()->front();
+    for (Operation *wrapper : llvm::reverse(wrappers)) {
+      rewriter.setInsertionPoint(bodyStart);
       materializePrivates(wrapper, rewriter);
+      for (Operation &inner :
+           llvm::make_early_inc_range(wrapper->getRegion(0).front())) {
+        if (toMove.contains(&inner)) {
+          rewriter.moveOpBefore(&inner, bodyStart);
+        }
+      }
+    }
+
+    // TODO: reductions still use one accumulator per wrapper, outside the
+    // loop; they should become scf.reduce.
+    for (Operation *wrapper : wrappers) {
       materializeReductions(wrapper, rewriter);
       promoteAndDelete(wrapper, rewriter);
     }
@@ -552,9 +645,6 @@ public:
     MLIRContext *ctx = moduleOp->getContext();
     OpBuilder opBuilder(ctx);
 
-    // FIXME: use scf::ParallelOp instead of fir::DoLoop for wsLoopOp
-    // Also, for scf::ParallelOp, use scf::ReduceOp instead of non-atomic
-    // operations
     RewritePatternSet patterns(ctx);
     patterns.add<FlattenPattern>(ctx);
     patterns.add<MapHostEvalPattern>(ctx);
@@ -566,6 +656,15 @@ public:
             applyPatternsGreedily(moduleOp, frozenRewritePatternSet, config))) {
       signalPassFailure();
       return;
+    }
+    // FlattenPattern reports why it rejected a loop; do not let the pass
+    // succeed with OpenMP loops left in the IR.
+    WalkResult result = moduleOp.walk([](omp::LoopNestOp loop) {
+      loop.emitError("OpenMP loop was not flattened");
+      return WalkResult::interrupt();
+    });
+    if (result.wasInterrupted()) {
+      signalPassFailure();
     }
     return;
   };
