@@ -22,6 +22,7 @@
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/IRMapping.h>
 #include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/IR/SymbolTable.h>
@@ -54,161 +55,6 @@ static unsigned getMapVarsOffset(Operation *wrapper) {
            targetOp.numInReductionBlockArgs() + targetOp.numHostEvalBlockArgs();
   }
   llvm_unreachable("unexpected type for getting mapvars Offset!");
-}
-
-static unsigned getReductionVarsOffset(Operation *wrapper) {
-  return llvm::TypeSwitch<Operation *, unsigned>(wrapper)
-      .Case([&](omp::WsloopOp wsLoopOp) {
-        // [private_vars, reduction_vars]
-        return wsLoopOp.numPrivateBlockArgs();
-      })
-      .Case([&](omp::TeamsOp teamsOp) {
-        // [private_vars, reduction_vars]
-        return teamsOp.numPrivateBlockArgs();
-      })
-      .Case([&](omp::SimdOp simdOp) {
-        // [private_vars, reduction_vars]
-        return simdOp.numPrivateBlockArgs();
-      })
-      .Default([&](Operation *) -> unsigned {
-        llvm_unreachable(
-            "unexpected operation for getting reduction vars offset!");
-      });
-}
-
-static mlir::Type unwrapElementType(mlir::Type type) {
-  while (true) {
-    if (auto refTy = llvm::dyn_cast<fir::ReferenceType>(type)) {
-      type = refTy.getEleTy();
-      continue;
-    }
-    if (auto ptrTy = llvm::dyn_cast<fir::PointerType>(type)) {
-      type = ptrTy.getEleTy();
-      continue;
-    }
-    if (auto heapTy = llvm::dyn_cast<fir::HeapType>(type)) {
-      type = heapTy.getEleTy();
-      continue;
-    }
-    if (auto boxTy = llvm::dyn_cast<fir::BaseBoxType>(type)) {
-      type = boxTy.getEleTy();
-      continue;
-    }
-    if (auto seqTy = llvm::dyn_cast<fir::SequenceType>(type)) {
-      type = seqTy.getEleTy();
-      continue;
-    }
-    if (auto shapedTy = llvm::dyn_cast<mlir::ShapedType>(type)) {
-      type = shapedTy.getElementType();
-      continue;
-    }
-    return type;
-  }
-}
-
-template <typename T>
-static omp::DeclareReductionOp findReductionRecipe(T op, unsigned index) {
-  std::optional<ArrayAttr> syms = op.getReductionSyms();
-  assert(syms);
-  assert(index < syms->size());
-  auto symbol = cast<SymbolRefAttr>((*syms)[index]);
-  return SymbolTable::lookupNearestSymbolFrom<omp::DeclareReductionOp>(
-      op.getOperation(), symbol);
-}
-
-static Value getInitializedValue(omp::DeclareReductionOp recipe,
-                                 PatternRewriter &rewriter) {
-  auto &initRegion = recipe.getInitializerRegion();
-  Block &initBlock = initRegion.front();
-
-  auto initYield = dyn_cast<omp::YieldOp>(initBlock.getTerminator());
-
-  if (!initYield || initYield->getNumOperands() != 1 ||
-      !llvm::hasSingleElement(initBlock.without_terminator())) {
-    return nullptr;
-  }
-
-  Value initializedValue = initYield.getOperand(0);
-  auto initializer = initializedValue.getDefiningOp<arith::ConstantOp>();
-  assert(initializer);
-  Operation *cloned = rewriter.clone(*initializer.getOperation());
-  return cloned->getResult(0);
-  return initializedValue;
-}
-
-static std::optional<arith::AtomicRMWKind> classifyCombiner(Operation *op) {
-  if (llvm::isa<arith::AddIOp>(op))
-    return arith::AtomicRMWKind::addi;
-  if (llvm::isa<arith::AddFOp>(op))
-    return arith::AtomicRMWKind::addf;
-  if (llvm::isa<arith::MulIOp>(op))
-    return arith::AtomicRMWKind::muli;
-  if (llvm::isa<arith::MulFOp>(op))
-    return arith::AtomicRMWKind::mulf;
-  if (llvm::isa<arith::MaxNumFOp>(op))
-    return arith::AtomicRMWKind::maxnumf;
-  if (llvm::isa<arith::MinNumFOp>(op))
-    return arith::AtomicRMWKind::minnumf;
-  llvm::errs() << "\nUnexpected Reduction Combiner: ";
-  op->dump();
-  return std::nullopt;
-}
-
-// TODO: in fact it reduce can accept complicated reductions, but we're only
-// going to accept Add, Mul, MAXF, MINF Can be expanded but also need to expand
-// Enzyme-JAX.
-static std::optional<arith::AtomicRMWKind>
-getCombiner(omp::DeclareReductionOp recipe) {
-  auto &reductionRegion = recipe.getReductionRegion();
-  Block &reductionBlock = reductionRegion.front();
-
-  auto reductionYield = dyn_cast<omp::YieldOp>(reductionBlock.getTerminator());
-
-  if (!reductionYield || reductionYield->getNumOperands() != 1 ||
-      reductionBlock.getNumArguments() != 2 ||
-      !llvm::hasSingleElement(reductionBlock.without_terminator())) {
-    return std::nullopt;
-  }
-
-  Operation *combiner = reductionYield.getOperand(0).getDefiningOp();
-
-  if (!combiner || combiner->getNumOperands() != 2 ||
-      combiner->getNumResults() != 1 ||
-      combiner->getOperand(0) != reductionBlock.getArgument(0) ||
-      combiner->getOperand(1) != reductionBlock.getArgument(1))
-    return std::nullopt;
-
-  return classifyCombiner(combiner);
-}
-
-static Value combineReduction(arith::AtomicRMWKind kind, Value localAcc,
-                              Value globalAcc, Location loc,
-                              PatternRewriter &rewriter) {
-  if (kind == arith::AtomicRMWKind::addi) {
-    return arith::AddIOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  if (kind == arith::AtomicRMWKind::addf) {
-    return arith::AddFOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  if (kind == arith::AtomicRMWKind::muli) {
-    return arith::MulIOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  if (kind == arith::AtomicRMWKind::mulf) {
-    return arith::MulFOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  if (kind == arith::AtomicRMWKind::maxnumf) {
-    return arith::MaxNumFOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  if (kind == arith::AtomicRMWKind::minnumf) {
-    return arith::MinNumFOp::create(rewriter, loc, localAcc, globalAcc)
-        .getResult();
-  }
-  llvm_unreachable("unexpected kind");
 }
 
 struct MapHostEvalPattern : public OpRewritePattern<omp::TargetOp> {
@@ -279,24 +125,92 @@ static omp::PrivateClauseOp getPrivateRecipe(Operation *wrapper,
       wrapper, cast<SymbolRefAttr>(syms[index]));
 }
 
-// Checks that the private variables of `wrappers` can get one copy per
-// iteration of the parallel loop, and collects the ops that must move into the
-// loop body with them.
+static omp::DeclareReductionOp getReductionRecipe(Operation *wrapper,
+                                                  unsigned index) {
+  auto syms = wrapper->getAttrOfType<ArrayAttr>("reduction_syms");
+  assert(syms && index < syms.size());
+  return SymbolTable::lookupNearestSymbolFrom<omp::DeclareReductionOp>(
+      wrapper, cast<SymbolRefAttr>(syms[index]));
+}
+
+// Clones the single block of `region` at the insertion point, with its
+// arguments replaced by `args`, and returns the value it yields.
+static Value cloneRegionInline(Region &region, ValueRange args,
+                               PatternRewriter &rewriter) {
+  Block &block = region.front();
+  IRMapping mapping;
+  for (auto [from, to] : llvm::zip(block.getArguments(), args)) {
+    mapping.map(from, to);
+  }
+  for (Operation &op : block.without_terminator()) {
+    rewriter.clone(op, mapping);
+  }
+  return mapping.lookupOrDefault(block.getTerminator()->getOperand(0));
+}
+
+namespace {
+// One item of a reduction clause on a wrapper of the loop.
+struct ReductionItem {
+  Operation *wrapper;
+  unsigned index;
+  omp::DeclareReductionOp recipe;
+  // True if the reduced variable is defined outside all wrappers: the loop
+  // reduces into it with scf.reduce. Otherwise it is the copy of an enclosing
+  // wrapper's reduction (e.g. `teams parallel do reduction(+:s)` gives teams
+  // and wsloop a reduction each, the wsloop one on the teams copy). That copy
+  // is per iteration too, so the inner copy is combined into it at the end of
+  // the iteration.
+  bool onLoop;
+  // The per-iteration copy, set when it is built.
+  Value copy;
+};
+} // namespace
+
+// Checks that the private and reduction variables of `wrappers` can get one
+// copy per iteration of the parallel loop, and collects the ops that must move
+// into the loop body with them.
 //
-// Every private block argument is replaced by an alloca inside the loop body.
-// Its users outside the loop (e.g. the hlfir.declare of the private copy in an
-// omp.parallel block) would then use a value that does not dominate them, so
-// they move into the loop body too. They used to run once per thread and will
-// run once per iteration, which is only equivalent if they have no side
-// effects.
-static LogicalResult
-collectPrivateUsesToMove(omp::LoopNestOp loop, ArrayRef<Operation *> wrappers,
-                         llvm::SetVector<Operation *> &toMove) {
+// Every private or reduction block argument is replaced by an alloca inside
+// the loop body. Its users outside the loop (e.g. the hlfir.declare of the
+// copy in an omp.parallel block) would then use a value that does not
+// dominate them, so they move into the loop body too. They used to run once
+// per thread and will run once per iteration, which is only equivalent if they
+// have no side effects.
+static LogicalResult analyzeWrappers(omp::LoopNestOp loop,
+                                     ArrayRef<Operation *> wrappers,
+                                     llvm::SetVector<Operation *> &toMove,
+                                     llvm::SmallVectorImpl<ReductionItem> &reductions) {
+  auto isScalar = [](Type type) {
+    return type.isIntOrIndexOrFloat() || isa<fir::LogicalType>(type);
+  };
   llvm::SmallVector<Value> worklist;
-  for (Operation *wrapper : wrappers) {
+  // Outer wrappers first, so `reductions` lists enclosing reductions first.
+  for (Operation *wrapper : llvm::reverse(wrappers)) {
     auto iface = dyn_cast<omp::BlockArgOpenMPOpInterface>(wrapper);
     if (!iface) {
       return wrapper->emitError("unsupported OpenMP loop wrapper");
+    }
+    auto byref = wrapper->getAttrOfType<DenseBoolArrayAttr>("reduction_byref");
+    for (auto [i, arg] : llvm::enumerate(iface.getReductionBlockArgs())) {
+      omp::DeclareReductionOp recipe = getReductionRecipe(wrapper, i);
+      // Only by-value scalars for now: the copy is a plain alloca set to the
+      // init region's value, and the init region must not read its argument
+      // (the original value, only needed as a mold for allocations).
+      Region &init = recipe.getInitializerRegion();
+      if ((byref && byref.asArrayRef()[i]) || !recipe.getAllocRegion().empty() ||
+          !recipe.getCleanupRegion().empty() || !init.hasOneBlock() ||
+          !init.front().getArgument(0).use_empty() ||
+          !recipe.getReductionRegion().hasOneBlock() ||
+          !isScalar(recipe.getType())) {
+        return recipe.emitError(
+            "only by-value scalar reductions are supported");
+      }
+      Value var = iface.getReductionVars()[i];
+      bool onLoop = !wrappers.back()->isAncestor(
+          var.getParentRegion()->getParentOp());
+      reductions.push_back({wrapper, static_cast<unsigned>(i), recipe, onLoop,
+                            Value()});
+      worklist.push_back(arg);
     }
     for (auto [i, arg] : llvm::enumerate(iface.getPrivateBlockArgs())) {
       omp::PrivateClauseOp recipe = getPrivateRecipe(wrapper, i);
@@ -304,8 +218,7 @@ collectPrivateUsesToMove(omp::LoopNestOp loop, ArrayRef<Operation *> wrappers,
       // Only scalars for now: their copy is a plain alloca (+ load/store for
       // firstprivate). Others need the init/copy/dealloc regions.
       if (!recipe.getInitRegion().empty() ||
-          !recipe.getDeallocRegion().empty() ||
-          !(type.isIntOrIndexOrFloat() || isa<fir::LogicalType>(type))) {
+          !recipe.getDeallocRegion().empty() || !isScalar(type)) {
         return recipe.emitError("only scalar private variables are supported");
       }
       worklist.push_back(arg);
@@ -318,13 +231,14 @@ collectPrivateUsesToMove(omp::LoopNestOp loop, ArrayRef<Operation *> wrappers,
       if (loop->isAncestor(user) || toMove.contains(user)) {
         continue;
       }
-      // A nested wrapper may privatize this value again; that wrapper's
-      // private copy is built inside the loop body.
+      // A nested wrapper may privatize or reduce this value again; that
+      // wrapper's copy is built inside the loop body.
       if (llvm::is_contained(wrappers, user)) {
         auto iface = cast<omp::BlockArgOpenMPOpInterface>(user);
-        if (!llvm::is_contained(iface.getPrivateVars(), value)) {
-          return user->emitError(
-              "private variable used by a clause other than private");
+        if (!llvm::is_contained(iface.getPrivateVars(), value) &&
+            !llvm::is_contained(iface.getReductionVars(), value)) {
+          return user->emitError("private or reduction variable used by a "
+                                 "clause other than private or reduction");
         }
         continue;
       }
@@ -335,13 +249,34 @@ collectPrivateUsesToMove(omp::LoopNestOp loop, ArrayRef<Operation *> wrappers,
       bool pure = isa<hlfir::DeclareOp, fir::DeclareOp>(user) ||
                   (user->getNumRegions() == 0 && isMemoryEffectFree(user));
       if (!beforeLoop || !pure) {
-        return user->emitError(
-            "cannot move this use of a private variable into the loop");
+        return user->emitError("cannot move this use of a private or "
+                               "reduction variable into the loop");
       }
       toMove.insert(user);
       for (Value result : user->getResults()) {
         worklist.push_back(result);
       }
+    }
+  }
+
+  // A reduction that is not on the loop combines into an enclosing copy at
+  // the end of each iteration, so its variable must be that copy (or a value
+  // moved into the loop with it), not something shared by all iterations.
+  for (ReductionItem &r : reductions) {
+    if (r.onLoop) {
+      continue;
+    }
+    Value var =
+        cast<omp::BlockArgOpenMPOpInterface>(r.wrapper).getReductionVars()
+            [r.index];
+    auto arg = dyn_cast<BlockArgument>(var);
+    bool isEnclosingCopy =
+        (arg && llvm::is_contained(wrappers, arg.getOwner()->getParentOp())) ||
+        toMove.contains(var.getDefiningOp());
+    if (!isEnclosingCopy) {
+      return r.wrapper->emitError(
+          "reduction variable must be defined outside the loop's constructs "
+          "or be the copy of an enclosing reduction or private variable");
     }
   }
   return success();
@@ -408,68 +343,45 @@ static void materializePrivates(Operation *op, PatternRewriter &rewriter) {
       .Default([&](Operation *) {});
 }
 
+// Replaces the reduction block argument of `r` by a fresh copy created at the
+// current insertion point (in the loop body, so one per iteration), starting
+// at the identity value given by the recipe's init region.
+static void materializeReductionCopy(ReductionItem &r, PatternRewriter &rewriter) {
+  auto iface = cast<omp::BlockArgOpenMPOpInterface>(r.wrapper);
+  Location loc = r.wrapper->getLoc();
+  auto copy = fir::AllocaOp::create(rewriter, loc, r.recipe.getType());
+  Value identity =
+      cloneRegionInline(r.recipe.getInitializerRegion(), ValueRange(),
+                        rewriter);
+  fir::StoreOp::create(rewriter, loc, identity, copy.getResult());
+  rewriter.replaceAllUsesWith(iface.getReductionBlockArgs()[r.index],
+                              copy.getResult());
+  r.copy = copy.getResult();
+}
+
+// Removes the reduction clause; its block arguments have no uses left.
 template <typename T>
-void materializeReductionsImpl(T op, PatternRewriter &rewriter) {
+static void eraseReductionClauseImpl(T op, PatternRewriter &rewriter) {
   auto iface = cast<omp::BlockArgOpenMPOpInterface>(op.getOperation());
-  unsigned reductionVarNum = iface.numReductionBlockArgs();
-  if (reductionVarNum == 0) {
+  unsigned start = iface.getReductionBlockArgsStart();
+  unsigned num = iface.numReductionBlockArgs();
+  if (num == 0) {
     return;
   }
-
-  Block &entryBlock = op->getRegion(0).getBlocks().front();
-  Location loc = op->getLoc();
-  auto reductionOffset = getReductionVarsOffset(op);
-  for (unsigned i = 0; i < reductionVarNum; i++) {
-    omp::DeclareReductionOp recipe = findReductionRecipe(op, i);
-    assert(recipe);
-
-    auto reduceVar = iface.getReductionVars()[i];
-    auto reduceArg = entryBlock.getArgument(i + reductionOffset);
-
-    rewriter.setInsertionPointToStart(&entryBlock);
-    auto reduceAccType = unwrapElementType(reduceArg.getType());
-    assert(reduceAccType.isIntOrFloat());
-    auto alloca = fir::AllocaOp::create(rewriter, loc, reduceAccType);
-    auto initVal = getInitializedValue(recipe, rewriter);
-    fir::StoreOp::create(rewriter, loc, initVal, alloca);
-    rewriter.replaceAllUsesWith(reduceArg, alloca.getResult());
-
-    if (entryBlock.mightHaveTerminator()) {
-      if (entryBlock.getTerminator()) {
-        rewriter.setInsertionPoint(entryBlock.getTerminator());
-      } else {
-        rewriter.setInsertionPointToEnd(&entryBlock);
-      }
-    } else {
-      rewriter.setInsertionPointToEnd(&entryBlock);
-    }
-    auto localAcc =
-        fir::LoadOp::create(rewriter, loc, alloca.getResult()).getResult();
-    auto globalAcc = fir::LoadOp::create(rewriter, loc, reduceVar).getResult();
-    assert(getCombiner(recipe).has_value());
-    auto kind = getCombiner(recipe).value();
-    auto res = combineReduction(kind, localAcc, globalAcc, loc, rewriter);
-    fir::StoreOp::create(rewriter, loc, res, reduceVar);
-  }
-
   rewriter.modifyOpInPlace(op, [&] {
     op.getReductionVarsMutable().clear();
     op->removeAttr("reduction_syms");
     op->removeAttr("reduction_byref");
     op->removeAttr("reduction_mod");
-
-    for (int i = reductionVarNum - 1; i >= 0; i--)
-      entryBlock.eraseArgument(reductionOffset + i);
+    op.getRegion().front().eraseArguments(start, num);
   });
-
-  return;
 }
 
-static void materializeReductions(Operation *op, PatternRewriter &rewriter) {
+static void eraseReductionClause(Operation *op, PatternRewriter &rewriter) {
   llvm::TypeSwitch<Operation *>(op)
       .Case<omp::ParallelOp, omp::TeamsOp, omp::WsloopOp, omp::LoopOp,
             omp::SimdOp>([&](auto typedOp) {
-        return materializeReductionsImpl(typedOp, rewriter);
+        return eraseReductionClauseImpl(typedOp, rewriter);
       })
       .Default([&](Operation *) {});
 }
@@ -527,7 +439,11 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     return val;
   };
 
+  // Replaces `op` by an scf.parallel. Each of `reduceVars` is loaded before
+  // the loop as an init value of the scf.parallel; the caller ends the body
+  // with the matching scf.reduce and stores the results back.
   FailureOr<scf::ParallelOp> replaceNestLoopOp(omp::LoopNestOp op,
+                                               ValueRange reduceVars,
                                                PatternRewriter &rewriter) const {
 
     if (!op.getLoopInclusive())
@@ -560,8 +476,12 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
     llvm::SmallVector<Value> zeros(tripCounts.size(), zero);
     llvm::SmallVector<Value> ones(tripCounts.size(), one);
-    auto scfParallelOp =
-        scf::ParallelOp::create(rewriter, loc, zeros, tripCounts, ones);
+    llvm::SmallVector<Value> inits;
+    for (Value var : reduceVars) {
+      inits.push_back(fir::LoadOp::create(rewriter, loc, var));
+    }
+    auto scfParallelOp = scf::ParallelOp::create(rewriter, loc, zeros,
+                                                 tripCounts, ones, inits);
 
     // Move Fir Loop to ScfParallelOp
     rewriter.setInsertionPointToStart(scfParallelOp.getBody());
@@ -580,11 +500,15 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
       newInductionVars.push_back(iv);
     }
 
+    // Without init values the builder adds an empty scf.reduce terminator;
+    // with them the body has no terminator yet.
     auto *targetBlock = scfParallelOp.getBody();
     auto *sourceBlock = &op.getRegion().front();
+    Block::iterator insertPt = inits.empty()
+                                   ? targetBlock->getTerminator()->getIterator()
+                                   : targetBlock->end();
     rewriter.eraseOp(sourceBlock->getTerminator());
-    rewriter.inlineBlockBefore(sourceBlock, targetBlock,
-                               targetBlock->getTerminator()->getIterator(),
+    rewriter.inlineBlockBefore(sourceBlock, targetBlock, insertPt,
                                newInductionVars);
     rewriter.eraseOp(op);
     return scfParallelOp;
@@ -603,22 +527,42 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
     // wrapper, all with parallelism semantics.
     // TODO: check if there is a clause prevent parallelism
     llvm::SetVector<Operation *> toMove;
-    if (failed(collectPrivateUsesToMove(op, wrappers, toMove))) {
+    llvm::SmallVector<ReductionItem> reductions;
+    if (failed(analyzeWrappers(op, wrappers, toMove, reductions))) {
       return failure();
     }
-    FailureOr<scf::ParallelOp> loop = replaceNestLoopOp(op, rewriter);
+    llvm::SmallVector<ReductionItem *> loopReductions;
+    llvm::SmallVector<Value> loopReduceVars;
+    for (ReductionItem &r : reductions) {
+      if (r.onLoop) {
+        loopReductions.push_back(&r);
+        loopReduceVars.push_back(
+            cast<omp::BlockArgOpenMPOpInterface>(r.wrapper)
+                .getReductionVars()[r.index]);
+      }
+    }
+    FailureOr<scf::ParallelOp> loop =
+        replaceNestLoopOp(op, loopReduceVars, rewriter);
     if (failed(loop)) {
       return failure();
     }
+    Location loc = loop->getLoc();
+    Block *body = loop->getBody();
 
-    // Build the private copies inside the loop body, outer wrappers first, and
-    // move the ops that use them in after them. The body then starts with
+    // Build the private and reduction copies inside the loop body, outer
+    // wrappers first, and move the ops that use them in after them. The body
+    // then starts with
     //   [outer copies][outer moved ops][inner copies][inner moved ops][iv]...
     // so every copy and moved op comes after the values it uses.
-    Operation *bodyStart = &loop->getBody()->front();
+    Operation *bodyStart = &body->front();
     for (Operation *wrapper : llvm::reverse(wrappers)) {
       rewriter.setInsertionPoint(bodyStart);
       materializePrivates(wrapper, rewriter);
+      for (ReductionItem &r : reductions) {
+        if (r.wrapper == wrapper) {
+          materializeReductionCopy(r, rewriter);
+        }
+      }
       for (Operation &inner :
            llvm::make_early_inc_range(wrapper->getRegion(0).front())) {
         if (toMove.contains(&inner)) {
@@ -627,10 +571,50 @@ struct FlattenPattern : public OpRewritePattern<omp::LoopNestOp> {
       }
     }
 
-    // TODO: reductions still use one accumulator per wrapper, outside the
-    // loop; they should become scf.reduce.
+    // End of each iteration. First combine every copy that belongs to an
+    // enclosing copy into it, inner ones first, then reduce the copies of the
+    // variables outside the loop with scf.reduce.
+    if (body->mightHaveTerminator()) {
+      rewriter.setInsertionPoint(body->getTerminator());
+    } else {
+      rewriter.setInsertionPointToEnd(body);
+    }
+    for (ReductionItem &r : llvm::reverse(reductions)) {
+      if (r.onLoop) {
+        continue;
+      }
+      // Read the operand now: it was replaced by the enclosing copy.
+      Value var = cast<omp::BlockArgOpenMPOpInterface>(r.wrapper)
+                      .getReductionVars()[r.index];
+      Value outer = fir::LoadOp::create(rewriter, loc, var);
+      Value local = fir::LoadOp::create(rewriter, loc, r.copy);
+      Value combined = cloneRegionInline(r.recipe.getReductionRegion(),
+                                         {outer, local}, rewriter);
+      fir::StoreOp::create(rewriter, loc, combined, var);
+    }
+    if (!loopReductions.empty()) {
+      llvm::SmallVector<Value> contributions;
+      for (ReductionItem *r : loopReductions) {
+        contributions.push_back(fir::LoadOp::create(rewriter, loc, r->copy));
+      }
+      auto reduce = scf::ReduceOp::create(rewriter, loc, contributions);
+      for (auto [region, r] : llvm::zip(reduce.getReductions(), loopReductions)) {
+        Block &block = region.front();
+        rewriter.setInsertionPointToStart(&block);
+        Value combined = cloneRegionInline(r->recipe.getReductionRegion(),
+                                           block.getArguments(), rewriter);
+        scf::ReduceReturnOp::create(rewriter, loc, combined);
+      }
+      // The init values were the original variables, so the results already
+      // include them.
+      rewriter.setInsertionPointAfter(*loop);
+      for (auto [result, var] : llvm::zip(loop->getResults(), loopReduceVars)) {
+        fir::StoreOp::create(rewriter, loc, result, var);
+      }
+    }
+
     for (Operation *wrapper : wrappers) {
-      materializeReductions(wrapper, rewriter);
+      eraseReductionClause(wrapper, rewriter);
       promoteAndDelete(wrapper, rewriter);
     }
     return success();

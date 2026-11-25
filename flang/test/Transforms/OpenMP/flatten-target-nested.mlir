@@ -85,35 +85,37 @@ module {
     // NESTED-RED: omp.target map_entries(%{{[0-9]+}} -> %{{[a-z0-9]+}}, %{{[0-9]+}} -> [[E2:%[a-z0-9]+]] :
     // NESTED-RED: [[E2T:%[^ ]+]] = fir.alloca f64 {bindc_name = "e2_t"}
     // NESTED-RED-NOT: omp.teams
-    // The teams reduction gets a local accumulator before the ic loop.
-    // NESTED-RED: [[TEAMS_ACC:%[^ ]+]] = fir.alloca f64
+    // ic loop: teams reduction(+:e2) becomes the loop's reduction, with the
+    // original e2 as init. Each iteration has its own copy of e2, starting at 0.
+    // NESTED-RED: [[E2_INIT:%[^ ]+]] = fir.load [[E2]]
+    // NESTED-RED: [[E2_RES:%[^ ]+]] = scf.parallel ({{.*}}) init ([[E2_INIT]]) -> f64 {
+    // NESTED-RED-NEXT: [[TEAMS_ACC:%[^ ]+]] = fir.alloca f64
     // NESTED-RED: fir.store %{{.*}} to [[TEAMS_ACC]]
-    // ic loop
-    // NESTED-RED: scf.parallel
+    // e2_t = 0, then the ib/ia loop (collapse(2): one 2-D loop) with
+    // reduction(+:e2_t), init e2_t.
     // NESTED-RED: fir.store %{{.*}} to [[E2T]]
-    // The wsloop reduction gets its own accumulator inside the ic loop.
-    // NESTED-RED: [[WS_ACC:%[^ ]+]] = fir.alloca f64
+    // NESTED-RED: [[E2T_INIT:%[^ ]+]] = fir.load [[E2T]]
+    // NESTED-RED: [[E2T_RES:%[^ ]+]] = scf.parallel (%{{[^,]+}}, %{{[^)]+}}) = {{.*}} init ([[E2T_INIT]]) -> f64 {
+    // NESTED-RED-NEXT: [[WS_ACC:%[^ ]+]] = fir.alloca f64
     // NESTED-RED: fir.store %{{.*}} to [[WS_ACC]]
-    // ib and ia loops (collapse(2)): one 2-D loop
-    // NESTED-RED: scf.parallel (%{{[^,]+}}, %{{[^)]+}})
     // NESTED-RED: fir.load [[WS_ACC]]
     // NESTED-RED: arith.addf
     // NESTED-RED: fir.store %{{.*}} to [[WS_ACC]]
-    // Combine the wsloop reduction into e2_t.
-    // NESTED-RED: fir.load [[WS_ACC]]
-    // NESTED-RED: fir.load [[E2T]]
+    // NESTED-RED: [[WS_X:%[^ ]+]] = fir.load [[WS_ACC]]
+    // NESTED-RED-NEXT: scf.reduce([[WS_X]] : f64) {
     // NESTED-RED: arith.addf
-    // NESTED-RED: fir.store %{{.*}} to [[E2T]]
-    // e2 = e2 + e2_t now updates the teams accumulator.
+    // NESTED-RED: scf.reduce.return
+    // NESTED-RED: fir.store [[E2T_RES]] to [[E2T]]
+    // e2 = e2 + e2_t updates this iteration's copy of e2, which is then reduced.
     // NESTED-RED: fir.load [[E2T]]
     // NESTED-RED: fir.load [[TEAMS_ACC]]
     // NESTED-RED: arith.addf
     // NESTED-RED: fir.store %{{.*}} to [[TEAMS_ACC]]
-    // Combine the teams reduction into e2 after the ic loop.
-    // NESTED-RED: fir.load [[TEAMS_ACC]]
-    // NESTED-RED: fir.load [[E2]]
+    // NESTED-RED: [[TEAMS_X:%[^ ]+]] = fir.load [[TEAMS_ACC]]
+    // NESTED-RED-NEXT: scf.reduce([[TEAMS_X]] : f64) {
     // NESTED-RED: arith.addf
-    // NESTED-RED: fir.store %{{.*}} to [[E2]]
+    // NESTED-RED: scf.reduce.return
+    // NESTED-RED: fir.store [[E2_RES]] to [[E2]]
     // NESTED-RED-NOT: omp.loop_nest
     // NESTED-RED-NOT: reduction(
     // NESTED-RED: omp.terminator

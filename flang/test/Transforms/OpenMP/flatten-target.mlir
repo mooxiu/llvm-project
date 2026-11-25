@@ -383,6 +383,25 @@ module {
       // SL-REDUCTION-NOT: omp.teams  
       // SL-REDUCTION-NOT: reduction 
       // SL-REDUCTION-NOT: private
+      // teams reduction(+:sum) is reduced by the loop, with the original sum
+      // as init. The wsloop reduction is on the teams copy, so its copy is
+      // combined into the teams copy at the end of each iteration. All copies
+      // (and the declares of them) are per iteration.
+      // SL-REDUCTION: %[[INIT:[^ ]+]] = fir.load %[[SUM:[^ ]+]] : !fir.ref<f64>
+      // SL-REDUCTION: %[[RES:[^ ]+]] = scf.parallel ({{.*}}) init (%[[INIT]]) -> f64 {
+      // SL-REDUCTION-NEXT: %[[TEAMS:[^ ]+]] = fir.alloca f64
+      // SL-REDUCTION: %[[TEAMS_DECL:[^ ]+]]:2 = hlfir.declare %[[TEAMS]] {uniq_name = "_QFFrun_benchmarkEsum"}
+      // SL-REDUCTION: fir.alloca i32
+      // SL-REDUCTION: %[[WS:[^ ]+]] = fir.alloca f64
+      // SL-REDUCTION: hlfir.declare %[[WS]] {uniq_name = "_QFFrun_benchmarkEsum"}
+      // SL-REDUCTION: arith.addf
+      // SL-REDUCTION: %[[OUTER:[^ ]+]] = fir.load %[[TEAMS_DECL]]#0
+      // SL-REDUCTION-NEXT: %[[LOCAL:[^ ]+]] = fir.load %[[WS]]
+      // SL-REDUCTION-NEXT: %[[C:[^ ]+]] = arith.addf %[[OUTER]], %[[LOCAL]]
+      // SL-REDUCTION-NEXT: fir.store %[[C]] to %[[TEAMS_DECL]]#0
+      // SL-REDUCTION-NEXT: %[[X:[^ ]+]] = fir.load %[[TEAMS]]
+      // SL-REDUCTION-NEXT: scf.reduce(%[[X]] : f64)
+      // SL-REDUCTION: fir.store %[[RES]] to %[[SUM]]
       omp.teams reduction(@add_reduction_f64 %45#0 -> %arg11 : !fir.ref<f64>) {
         %50:2 = hlfir.declare %arg11 {uniq_name = "_QFFrun_benchmarkEsum"} : (!fir.ref<f64>) -> (!fir.ref<f64>, !fir.ref<f64>)
         omp.parallel private(@_QFFrun_benchmarkEi_private_i32 %46#0 -> %arg12 : !fir.ref<i32>) {
